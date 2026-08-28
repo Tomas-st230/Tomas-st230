@@ -25,6 +25,8 @@ import numpy as np
 NONE = "none"
 NATURE = "nature"
 CITY = "city"
+#: Not a look: "measure the clip and pick one of the above, or none".
+AUTO = "auto"
 
 
 @dataclass(frozen=True)
@@ -83,7 +85,90 @@ CONTRAST_SCALE_MAX = 1.6
 
 
 def available() -> tuple[str, ...]:
-    return (NONE, NATURE, CITY)
+    return (NONE, AUTO, NATURE, CITY)
+
+
+# --------------------------------------------------------------------------
+# --look auto
+# --------------------------------------------------------------------------
+#
+# The evidence is deliberately coarse and scale-free. Two things make a naive
+# version wrong on this footage:
+#
+# 1. A D-Log frame is desaturated everywhere, so counting grey pixels alone
+#    labels a sunset over water as a city. So the two masses are compared as
+#    *shares of each other*, never against a fixed threshold.
+# 2. Grey without structure is haze, cloud or water, not architecture. So the
+#    city side has to be carried by vertical lines as well as by grey.
+#
+# The decision is made once per clip on the mean of the sampled frames, not
+# per frame: a look that changes shot to shot inside one clip would be worse
+# than no look at all.
+
+#: Minimum lead one side needs over the other. Below it, neither look is
+#: applied and the report says the evidence was too close to call.
+AUTO_MARGIN = 0.08
+#: Frames measured per clip. More than this buys nothing; the evidence is a
+#: whole-clip average of wide colour bands.
+AUTO_SAMPLE = 8
+#: Weight of the "there are vertical lines here" evidence in the city score.
+#: The floor is not zero: a street at night has few clean lines and is still
+#: a street.
+STRUCTURE_FLOOR = 0.4
+
+
+def _mean(values: list[float]) -> float:
+    return float(sum(values) / len(values)) if values else 0.0
+
+
+def classify_frames(signatures: list[dict]) -> dict:
+    """Pick a look for one clip from :func:`features.scene_signature` output.
+
+    Returns the choice, both scores, the averaged evidence and the number of
+    frames it was measured on. ``choice`` is :data:`NONE` when the two scores
+    are within :data:`AUTO_MARGIN` of each other - an undecided answer is a
+    real answer here, and better than grading a clip the wrong way.
+    """
+    usable = [s for s in signatures if s]
+    if not usable:
+        return {"choice": NONE, "nature_score": None, "city_score": None,
+                "margin": None, "evidence": None, "frames_measured": 0,
+                "decided": False}
+
+    evidence = {
+        "vegetation": _mean([float(s.get("vegetation") or 0.0) for s in usable]),
+        "sky": _mean([float(s.get("sky") or 0.0) for s in usable]),
+        "warm": _mean([float(s.get("warm") or 0.0) for s in usable]),
+        "grey": _mean([float(s.get("grey") or 0.0) for s in usable]),
+        # None means "too few lines to divide by", which is evidence against
+        # architecture, not a missing measurement to be filled in with a mean.
+        "vertical_share": _mean([float(s.get("vertical_share") or 0.0) for s in usable]),
+        "vertical_measured": sum(1 for s in usable if s.get("vertical_share") is not None),
+    }
+
+    colour_mass = evidence["vegetation"] + evidence["sky"] + evidence["warm"]
+    grey_mass = evidence["grey"]
+    total = colour_mass + grey_mass
+    if total <= 1e-6:
+        # Nothing to go on: an almost black clip, or one that is all blown out.
+        return {"choice": NONE, "nature_score": 0.0, "city_score": 0.0,
+                "margin": 0.0, "evidence": evidence,
+                "frames_measured": len(usable), "decided": False}
+
+    nature_score = colour_mass / total
+    structure = STRUCTURE_FLOOR + (1.0 - STRUCTURE_FLOOR) * min(1.0, evidence["vertical_share"])
+    city_score = (grey_mass / total) * structure
+
+    margin = abs(nature_score - city_score)
+    if margin < AUTO_MARGIN:
+        choice = NONE
+        decided = False
+    else:
+        choice = NATURE if nature_score > city_score else CITY
+        decided = True
+    return {"choice": choice, "nature_score": nature_score, "city_score": city_score,
+            "margin": margin, "evidence": evidence, "frames_measured": len(usable),
+            "decided": decided}
 
 
 def get(name: str | None) -> Look | None:

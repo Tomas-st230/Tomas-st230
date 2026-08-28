@@ -48,6 +48,25 @@ LOG_TRANSFER_TAGS = ("arib-std-b67", "smpte2084", "log100", "log316", "bt1361e")
 LOG_STATS_MAX_LUMA_SPAN = 0.55
 LOG_STATS_MAX_SATURATION = 0.22
 
+#: Container ``encoder`` tags that identify a DJI camera. Measured, not
+#: guessed: every file on Tomas's card - MP4 and LRF alike - carries
+#: ``encoder="DJI Lito X1"``, while its colour tags read ``bt709`` whatever
+#: picture profile was used.
+DJI_ENCODER_HINTS = ("dji",)
+
+#: The inference that finally makes a LUT land on the right clips.
+#:
+#: Premise: on DJI drones the 10-bit recording modes are D-Log, D-Log M and
+#: HLG; the Normal profile records 8-bit. So a DJI file in a 10-bit pixel
+#: format was not shot in Normal colour, even though its colour tags claim
+#: Rec.709. HLG is excluded first by its own transfer tag when the camera
+#: writes one - and when it does not, the caption sidecar settles it, which is
+#: why :mod:`framepicker.sidecar` is consulted before this rule.
+#:
+#: This is an inference about one manufacturer, so it is gated on the encoder
+#: tag and it is reported as a guess. ``--convert-log off`` overrides it.
+LOG_TENBIT_PIX_FMT_MARK = "10"
+
 
 class DecodeError(RuntimeError):
     pass
@@ -61,15 +80,21 @@ class DecodeError(RuntimeError):
 @dataclass
 class LogVerdict:
     is_log: bool         # true only on evidence strong enough to act on
-    source: str          # flag | metadata | filename | statistics | default
+    source: str          # flag | sidecar | metadata | filename | bitdepth | statistics | default
     detail: str          # what exactly was seen
     is_a_guess: bool
     statistics: dict | None = None
     suspected: bool = False   # measured as flat, but not acted upon
+    #: Which flat profile, when something actually said: dlog | dcinelike |
+    #: hlg | None. It matters because a D-Log LUT is wrong for HLG footage.
+    profile: str | None = None
+    color_mode: dict | None = None   # what the caption sidecar said, verbatim
 
     def as_dict(self) -> dict:
         return {
             "is_log": self.is_log,
+            "profile": self.profile,
+            "color_mode": self.color_mode,
             "suspected_flat": self.suspected,
             "source": self.source,
             "detail": self.detail,
@@ -104,34 +129,87 @@ def flatness(samples: Sequence[np.ndarray]) -> dict | None:
     }
 
 
-def detect_log(clip: ClipInfo, flag: str = "auto", stats: dict | None = None) -> LogVerdict:
-    """Decide whether *clip* is flat/log footage.
+def is_dji(clip: ClipInfo) -> bool:
+    """Was this written by a DJI camera? Read from the container tags."""
+    tags = (clip.extra or {}).get("format_tags") or {}
+    encoder = str(tags.get("encoder") or "").lower()
+    make = str(tags.get("make") or tags.get("com.apple.quicktime.make") or "").lower()
+    return any(hint in encoder or hint in make for hint in DJI_ENCODER_HINTS)
 
-    Order: explicit flag -> colour metadata -> filename hint -> measured frame
-    flatness -> off. The result is a guess unless the user forced it, and it
-    says so. *stats* comes from :func:`flatness`; when it is ``None`` the
-    measurement step is skipped.
+
+def is_ten_bit(clip: ClipInfo) -> bool:
+    return LOG_TENBIT_PIX_FMT_MARK in str(clip.pix_fmt or "")
+
+
+def detect_log(
+    clip: ClipInfo,
+    flag: str = "auto",
+    stats: dict | None = None,
+    color_mode=None,
+) -> LogVerdict:
+    """Decide whether *clip* needs converting before it looks right.
+
+    Order, strongest evidence first:
+
+    1. ``--convert-log on|off`` - the user said so.
+    2. The caption sidecar's ``color_md`` - the camera said so, in words.
+    3. A log colour-transfer or wide-primaries tag - rare on DJI, decisive
+       when present.
+    4. A filename hint.
+    5. DJI + a 10-bit pixel format - see :data:`LOG_TENBIT_PIX_FMT_MARK`.
+    6. Measured flatness - recorded as *suspicion only*, never acted on.
+
+    Everything below the flag is a guess and says so. *color_mode* comes from
+    :func:`framepicker.sidecar.read_color_mode`.
     """
+    mode_dict = color_mode.as_dict() if color_mode is not None else None
+
     if flag == "on":
-        return LogVerdict(True, "flag", "--convert-log on", is_a_guess=False, statistics=stats)
+        return LogVerdict(True, "flag", "--convert-log on", is_a_guess=False,
+                          statistics=stats, color_mode=mode_dict,
+                          profile=color_mode.kind if color_mode is not None else None)
     if flag == "off":
-        return LogVerdict(False, "flag", "--convert-log off", is_a_guess=False, statistics=stats)
+        return LogVerdict(False, "flag", "--convert-log off", is_a_guess=False,
+                          statistics=stats, color_mode=mode_dict)
+
+    # The camera's own word for the profile. Decisive in both directions: this
+    # is the one signal that says "this clip is Normal colour, leave it alone"
+    # in a card that mixes profiles.
+    if color_mode is not None and color_mode.kind != "other":
+        return LogVerdict(
+            color_mode.is_log, "sidecar",
+            f"color_md={color_mode.value} ({os.path.basename(color_mode.source)})",
+            is_a_guess=False, statistics=stats,
+            profile=color_mode.kind if color_mode.is_log else None,
+            color_mode=mode_dict,
+        )
 
     transfer = (clip.color_transfer or "").lower()
     primaries = (clip.color_primaries or "").lower()
     if transfer in LOG_TRANSFER_TAGS:
-        return LogVerdict(True, "metadata", f"color_transfer={transfer}", is_a_guess=True, statistics=stats)
+        profile = "hlg" if transfer == "arib-std-b67" else None
+        return LogVerdict(True, "metadata", f"color_transfer={transfer}", is_a_guess=True,
+                          statistics=stats, profile=profile, color_mode=mode_dict)
     if primaries == "bt2020" and transfer not in ("bt709", "bt470bg", "smpte170m", "iec61966-2-1"):
         return LogVerdict(
             True, "metadata",
             f"color_primaries={primaries}, color_transfer={transfer or '?'}",
-            is_a_guess=True, statistics=stats,
+            is_a_guess=True, statistics=stats, color_mode=mode_dict,
         )
 
     lowered = clip.name.lower()
     for hint in LOG_FILENAME_HINTS:
         if hint in lowered:
-            return LogVerdict(True, "filename", f"'{hint}' in {clip.name}", is_a_guess=True, statistics=stats)
+            return LogVerdict(True, "filename", f"'{hint}' in {clip.name}", is_a_guess=True,
+                              statistics=stats, profile="dlog", color_mode=mode_dict)
+
+    if is_dji(clip) and is_ten_bit(clip):
+        tags = (clip.extra or {}).get("format_tags") or {}
+        return LogVerdict(
+            True, "bitdepth",
+            f"encoder={tags.get('encoder') or '?'}, pix_fmt={clip.pix_fmt}",
+            is_a_guess=True, statistics=stats, profile="dlog", color_mode=mode_dict,
+        )
 
     if stats is not None:
         flat = (
@@ -141,9 +219,11 @@ def detect_log(clip: ClipInfo, flag: str = "auto", stats: dict | None = None) ->
         detail = f"luma_span={stats['luma_span']:.3f}, saturation={stats['saturation']:.3f}"
         # is_log stays False: a flat *scene* is not a flat *profile*, and acting
         # on the difference destroyed real exports. See the constants above.
-        return LogVerdict(False, "statistics", detail, is_a_guess=True, statistics=stats, suspected=flat)
+        return LogVerdict(False, "statistics", detail, is_a_guess=True, statistics=stats,
+                          suspected=flat, color_mode=mode_dict)
 
-    return LogVerdict(False, "default", "no log evidence", is_a_guess=True, statistics=stats)
+    return LogVerdict(False, "default", "no log evidence", is_a_guess=True,
+                      statistics=stats, color_mode=mode_dict)
 
 
 # --------------------------------------------------------------------------
@@ -280,6 +360,71 @@ def build_video_filter(
     return ",".join(parts)
 
 
+#: GPU scalers, tried in this order. Both ship with common CUDA builds;
+#: neither is assumed to exist.
+GPU_SCALERS = ("scale_cuda", "scale_npp")
+
+
+def build_gpu_video_filter(
+    out_w: int,
+    out_h: int,
+    fps: float | None,
+    lut_path: str | None,
+    scaler: str = "scale_cuda",
+) -> str:
+    """The same chain, but the frame stays on the GPU until it is small.
+
+    ``-hwaccel cuda`` on its own decodes on the GPU and then copies every
+    full-size frame back to system memory - for 4K 10-bit at 60 fps that copy
+    is the bulk of the work, and 59 of every 60 frames are thrown away
+    immediately afterwards. Dropping frames (``fps``) and scaling
+    (``scale_cuda``) before ``hwdownload`` moves both in front of the copy.
+
+    Whether this build supports it is *tested*, never assumed - see
+    :func:`gpu_scale_available`.
+    """
+    parts: list[str] = []
+    if fps:
+        parts.append(f"fps={fps}")
+    parts.append(f"{scaler}={out_w}:{out_h}")
+    parts.append("hwdownload")
+    parts.append("format=nv12")
+    if lut_path:
+        parts.append("format=rgb24")
+        parts.append(f"lut3d=file='{escape_filter_path(lut_path)}'")
+    parts.append("format=rgb24")
+    return ",".join(parts)
+
+
+def gpu_scale_available(
+    path: str, hwaccel: str, out_w: int, out_h: int, scaler: str = "scale_cuda"
+) -> tuple[bool, str]:
+    """Decode one frame through the GPU-scaling chain and look at the result.
+
+    Same premise-checking rule as :func:`hwaccel_available` (TRAP-12): the
+    chain that will be used is the chain that is tested, and a failure falls
+    back to the plain path instead of breaking the run.
+    """
+    if proc.executable(FFMPEG) is None:
+        return False, f"{FFMPEG} not on PATH"
+    argv = [
+        FFMPEG, "-hide_banner", "-nostdin", "-loglevel", "error",
+        "-hwaccel", hwaccel,
+        "-hwaccel_output_format", "cuda",
+        "-i", path,
+        "-frames:v", "1",
+        "-vf", build_gpu_video_filter(out_w, out_h, None, None, scaler),
+        "-f", "null", "-",
+    ]
+    try:
+        result = proc.run(argv, timeout=60)
+    except proc.ProcessError as exc:
+        return False, str(exc)
+    if result.ok:
+        return True, ""
+    return False, result.stderr_text(200) or f"exit {result.returncode}"
+
+
 @dataclass
 class DecodeReport:
     path_used: str = "cpu"            # "hw" or "cpu"
@@ -290,12 +435,23 @@ class DecodeReport:
     requested_fps: float = 0.0
     capped: bool = False
     stderr: str = ""
+    #: Name of the GPU scaler actually used, "" when the frames came back to
+    #: system memory at full size (which is what -hwaccel alone does).
+    gpu_scaler: str = ""
+    gpu_scale_error: str = ""
+    keyframes_only: bool = False
+    #: Set when the analysis ran on a proxy file instead of the master.
+    proxy_file: str = ""
     extra: dict = field(default_factory=dict)
 
     def as_dict(self) -> dict:
         return {
             "path_used": self.path_used,
             "hw_error": self.hw_error,
+            "gpu_scaler": self.gpu_scaler,
+            "gpu_scale_error": self.gpu_scale_error,
+            "keyframes_only": self.keyframes_only,
+            "proxy_file": self.proxy_file,
             "frames_yielded": self.frames_yielded,
             "frames_expected": self.frames_expected,
             "effective_fps": self.effective_fps,
@@ -338,6 +494,8 @@ def sample_frames(
     lut_path: str | None = None,
     hwaccel: str = "auto",
     max_candidates: int | None = None,
+    keyframes_only: bool = False,
+    gpu_scale: bool = True,
     cancel=None,
     report: DecodeReport | None = None,
 ) -> Iterator[tuple[float, np.ndarray]]:
@@ -366,16 +524,36 @@ def sample_frames(
     vf = build_video_filter(out_w, out_h, effective_fps, lut_path)
 
     use_hw = False
+    name = "cuda" if hwaccel == "auto" else hwaccel
     if hwaccel and hwaccel != "none":
-        name = "cuda" if hwaccel == "auto" else hwaccel
         use_hw, why = hwaccel_available(clip.path, name)
         if not use_hw:
             report.hw_error = why
     report.path_used = "hw" if use_hw else "cpu"
 
+    scaler = ""
+    if use_hw and gpu_scale:
+        for candidate in GPU_SCALERS:
+            ok, why = gpu_scale_available(clip.path, name, out_w, out_h, candidate)
+            if ok:
+                scaler = candidate
+                break
+            report.gpu_scale_error = why
+    report.gpu_scaler = scaler
+    if scaler:
+        vf = build_gpu_video_filter(out_w, out_h, effective_fps, lut_path, scaler)
+
     argv = [FFMPEG, "-hide_banner", "-nostdin", "-loglevel", "error", "-nostats"]
     if use_hw:
-        argv += ["-hwaccel", "cuda" if hwaccel == "auto" else hwaccel]
+        argv += ["-hwaccel", name]
+        if scaler:
+            argv += ["-hwaccel_output_format", "cuda"]
+    if keyframes_only:
+        # Only intra frames are decoded. Far less work, and the frames that
+        # survive are the highest-quality ones in the file - but the sampling
+        # grid becomes the camera's keyframe interval, so the report has to
+        # say what was actually sampled instead of what was asked for.
+        argv += ["-skip_frame", "nokey"]
     argv += [
         "-i", clip.path,
         "-an", "-sn", "-dn",
@@ -385,6 +563,7 @@ def sample_frames(
         "-pix_fmt", "rgb24",
         "-",
     ]
+    report.keyframes_only = keyframes_only
 
     frame_bytes = out_w * out_h * 3
     index = 0

@@ -196,7 +196,11 @@ def score_frame_explained(features: dict) -> tuple[float, list[str]]:
     else:
         reasons.append(S.reason_no_faces())
 
-    reasons.append(S.reason_sharpness_rank(sharp_rank * 100.0))
+    reasons.append(S.reason_sharpness_rank(sharp_rank * 100.0, features.get("sharpness")))
+    if sharp_rank >= SHARPNESS_SATURATION:
+        # Without this line the report says "sharpness: 74th percentile" and
+        # "technical: 1.00" next to each other and looks like it is lying.
+        reasons.append(S.reason_technical_gate(SHARPNESS_SATURATION * 100.0))
     reasons.append(S.reason_colorfulness_rank(color_rank * 100.0))
     reasons.append(S.reason_dynamic_range_rank(range_rank * 100.0))
     if clip_high > 0.005:
@@ -216,6 +220,8 @@ def score_frame_explained(features: dict) -> tuple[float, list[str]]:
             reasons.append(S.reason_subject_separation(float(features["subject_separation"])))
     if moment is not None:
         reasons.append(S.reason_motion(float(features.get("motion_rank") or 0.0) * 100.0))
+        if not (features.get("face_max_rel") or 0.0):
+            reasons.append(S.reason_moment_capped(MOTION_WITHOUT_PEOPLE))
 
     reasons.append(S.reason_component(S.COMPONENT_CONTENT, content))
     reasons.append(S.reason_component(S.COMPONENT_TECHNICAL, technical))

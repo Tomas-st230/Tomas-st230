@@ -114,3 +114,62 @@ def test_every_preset_is_reportable():
         if look is None:
             continue
         assert set(look.as_dict()) >= {"name", "target_saturation", "target_span", "warmth"}
+
+
+# --------------------------------------------------------------------------
+# --look auto
+# --------------------------------------------------------------------------
+
+
+def _flat_frame(height: int = 240, width: int = 320) -> np.ndarray:
+    return np.zeros((height, width, 3), dtype=np.uint8)
+
+
+def test_auto_picks_nature_for_a_green_and_blue_frame():
+    from framepicker import features
+
+    frame = _flat_frame()
+    frame[:120, :] = (40, 150, 60)     # vegetation
+    frame[120:, :] = (60, 120, 200)    # sky
+    result = grading.classify_frames([features.scene_signature(frame)])
+    assert result["choice"] == grading.NATURE
+    assert result["decided"] is True
+    assert result["nature_score"] > result["city_score"]
+
+
+def test_auto_picks_city_for_grey_with_vertical_lines():
+    from framepicker import features
+
+    frame = _flat_frame()
+    frame[:, :] = (128, 130, 132)      # concrete
+    for x in range(0, 320, 24):        # window columns and building edges
+        frame[:, x:x + 3] = (210, 212, 214)
+    result = grading.classify_frames([features.scene_signature(frame)])
+    assert result["choice"] == grading.CITY
+    assert result["decided"] is True
+
+
+def test_auto_refuses_to_decide_when_the_evidence_is_close():
+    """An undecided answer is a real answer: no look is applied."""
+    from framepicker import features
+
+    frame = _flat_frame()
+    frame[:120, :] = (128, 130, 132)   # grey: half the frame
+    frame[120:168, :] = (40, 150, 60)  # colour: a fifth of it
+    result = grading.classify_frames([features.scene_signature(frame)])
+    assert result["margin"] < grading.AUTO_MARGIN
+    assert result["choice"] == grading.NONE
+    assert result["decided"] is False
+    assert grading.get(result["choice"]) is None
+
+
+def test_auto_with_nothing_to_measure_is_not_a_crash():
+    result = grading.classify_frames([])
+    assert result["choice"] == grading.NONE
+    assert result["frames_measured"] == 0
+    assert result["decided"] is False
+
+
+def test_auto_is_offered_but_is_not_itself_a_look():
+    assert grading.AUTO in grading.available()
+    assert grading.get(grading.AUTO) is None

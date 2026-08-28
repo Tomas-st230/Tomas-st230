@@ -46,6 +46,8 @@ from framepicker.cli import (
     ORDER_DATE,
     VIDEO_SUFFIXES,
     Options,
+    default_out_dir,
+    default_source_dir,
     expand_inputs,
     run_batch,
 )
@@ -55,6 +57,7 @@ COLUMNS = (
     S.GUI_COL_FILE,
     S.GUI_COL_PROFILE,
     S.GUI_COL_COLOR,
+    S.GUI_COL_LOOK,
     S.GUI_COL_DECODE,
     S.GUI_COL_FRAMES,
     S.GUI_COL_STATUS,
@@ -77,10 +80,16 @@ PROFILE_CHOICES = (
 LOOK_CHOICES = tuple((S.LOOK_NAMES.get(name, name), name) for name in grading.available())
 
 
+#: Milliseconds the window waits for a cancelled run on close. Bounded on
+#: purpose: closing or shutting down must never be blocked by this program.
+CLOSE_WAIT_MS = 3000
+
+
 class _Worker(QObject):
     message = Signal(str)
     clip_done = Signal(dict)
-    finished = Signal(bool, str)
+    #: completed, report path, the folder this run actually wrote into
+    finished = Signal(bool, str, str)
 
     def __init__(self, options: Options, cancel: threading.Event) -> None:
         super().__init__()
@@ -94,23 +103,27 @@ class _Worker(QObject):
             cancel=self._cancel,
             on_clip_done=self.clip_done.emit,
         )
-        self.finished.emit(not result.cancelled, result.html_path or "")
+        self.finished.emit(not result.cancelled, result.html_path or "", result.out_dir or "")
 
 
 class DropWindow(QWidget):
-    def __init__(self, out_dir: str = DEFAULT_OUT_DIR) -> None:
+    def __init__(self, out_dir: str | None = None) -> None:
         super().__init__()
         self.setWindowTitle(S.APP_TITLE)
         self.setAcceptDrops(True)
         self.resize(920, 620)
 
-        self._initial_out_dir = os.path.abspath(out_dir)
+        self._initial_out_dir = os.path.abspath(out_dir or default_out_dir())
+        #: Where the file dialogs open. The footage folder when it exists.
+        self._browse_dir = default_source_dir() or ""
         self._order = ORDER_DATE
         self._paths: list[str] = []
         self._cancel = threading.Event()
         self._thread: QThread | None = None
         self._worker: _Worker | None = None
         self._report_path = ""
+        self._run_dir = ""
+        self._stopping = False
 
         self._drop = QLabel(S.GUI_DROP_HERE)
         self._drop.setAlignment(Qt.AlignCenter)
@@ -180,6 +193,11 @@ class DropWindow(QWidget):
         look_row.addWidget(self._look_strength)
         form.addRow(S.GUI_LOOK, look_row)
 
+        look_hint = QLabel(S.GUI_LOOK_AUTO_HINT)
+        look_hint.setWordWrap(True)
+        look_hint.setStyleSheet("color: palette(mid);")
+        form.addRow("", look_hint)
+
         self._min_score = QDoubleSpinBox()
         self._min_score.setRange(0.0, 1.0)
         self._min_score.setSingleStep(0.05)
@@ -229,24 +247,39 @@ class DropWindow(QWidget):
     # -- drag and drop -----------------------------------------------------
 
     def dragEnterEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        if self._busy():
+            return
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
 
     def dropEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        if self._busy():
+            self._status.setText(S.GUI_BUSY)
+            return
         dropped = [url.toLocalFile() for url in event.mimeData().urls()]
         self._set_paths(self._paths + [p for p in dropped if os.path.isdir(p) or self._is_video(p)])
         event.acceptProposedAction()
 
     def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802 - Qt naming
-        chosen, _ = QFileDialog.getOpenFileNames(self, S.APP_TITLE)
+        if self._busy():
+            self._status.setText(S.GUI_BUSY)
+            return
+        chosen, _ = QFileDialog.getOpenFileNames(self, S.APP_TITLE, self._browse_dir)
         if chosen:
             self._set_paths(self._paths + list(chosen))
+
+    def _busy(self) -> bool:
+        """Is a run in progress? While it is, the file list is frozen."""
+        return self._thread is not None
 
     @staticmethod
     def _is_video(path: str) -> bool:
         return path.lower().endswith(VIDEO_SUFFIXES)
 
     def _set_paths(self, paths: list[str]) -> None:
+        if self._busy():
+            self._status.setText(S.GUI_BUSY)
+            return
         # Expand here, with framepicker's own function, so the table rows are
         # exactly the files run_batch will process in exactly its order. A
         # dropped folder that showed as one row while the pipeline processed
@@ -271,12 +304,13 @@ class DropWindow(QWidget):
     # -- settings pickers --------------------------------------------------
 
     def _on_pick_lut(self) -> None:
-        chosen, _ = QFileDialog.getOpenFileName(self, S.GUI_LUT, "", "*.cube")
+        chosen, _ = QFileDialog.getOpenFileName(self, S.GUI_LUT, self._browse_dir, "*.cube")
         if chosen:
             self._lut.setText(chosen)
 
     def _on_pick_out_dir(self) -> None:
-        chosen = QFileDialog.getExistingDirectory(self, S.GUI_OUT_DIR, self._out_dir.text())
+        chosen = QFileDialog.getExistingDirectory(
+            self, S.GUI_OUT_DIR, self._out_dir.text() or self._browse_dir)
         if chosen:
             self._out_dir.setText(chosen)
 
@@ -324,6 +358,7 @@ class DropWindow(QWidget):
 
     def _on_clip_done(self, summary: dict) -> None:
         row = int(summary.get("index", 0))
+        last = len(COLUMNS) - 1
         if row >= self._table.rowCount():
             return
         if summary.get("ok"):
@@ -331,27 +366,31 @@ class DropWindow(QWidget):
             profile = S.GUI_UNKNOWN if is_log is None else (S.GUI_LOG_YES if is_log else S.GUI_LOG_NO)
             self._set_cell(row, 1, profile)
             self._set_cell(row, 2, COLOR_LABELS.get(summary.get("color_mode", ""), S.GUI_UNKNOWN))
-            self._set_cell(row, 3, DECODE_LABELS.get(summary.get("decode_path", ""), S.GUI_UNKNOWN))
-            self._set_cell(row, 4, str(summary.get("frames", 0)))
-            self._set_cell(row, 5, S.GUI_DONE)
+            self._set_cell(row, 3, S.LOOK_NAMES.get(summary.get("look", ""), S.GUI_UNKNOWN))
+            self._set_cell(row, 4, DECODE_LABELS.get(summary.get("decode_path", ""), S.GUI_UNKNOWN))
+            self._set_cell(row, 5, str(summary.get("frames", 0)))
+            self._set_cell(row, last, S.GUI_DONE)
         else:
-            for column in range(1, len(COLUMNS) - 1):
+            for column in range(1, last):
                 self._set_cell(row, column, S.GUI_UNKNOWN)
-            self._set_cell(row, 5, S.GUI_FAILED)
-            self._table.item(row, 5).setToolTip(str(summary.get("reason", "")))
+            self._set_cell(row, last, S.GUI_FAILED)
+            self._table.item(row, last).setToolTip(str(summary.get("reason", "")))
         self._progress.setValue(self._progress.value() + 1)
 
     def _on_cancel(self) -> None:
+        # Stopping means stopping: the pipeline deletes what this run wrote,
+        # and the window goes back to a state where new files can be loaded.
+        self._stopping = True
         self._cancel.set()
         self._cancel_button.setEnabled(False)
+        self._status.setText(S.GUI_STOPPING)
 
-    def _on_finished(self, completed: bool, report_path: str) -> None:
+    def _on_finished(self, completed: bool, report_path: str, out_dir: str) -> None:
         self._report_path = report_path
+        self._run_dir = out_dir
         self._status.setText(S.GUI_DONE if completed else S.GUI_CANCELLED)
-        self._start.setEnabled(bool(self._paths))
-        self._clear.setEnabled(True)
         self._cancel_button.setEnabled(False)
-        self._open_folder.setEnabled(completed)
+        self._open_folder.setEnabled(completed and bool(out_dir))
         self._open_report.setEnabled(bool(report_path) and os.path.isfile(report_path))
 
     def _on_thread_finished(self) -> None:
@@ -359,9 +398,33 @@ class DropWindow(QWidget):
         # the quit() that would let it exit is queued behind this very call.
         self._thread = None
         self._worker = None
+        if self._stopping:
+            # A cancelled run leaves nothing behind, so neither does the table.
+            self._stopping = False
+            self._set_paths([])
+            self._status.setText(S.GUI_CANCELLED)
+        else:
+            self._start.setEnabled(bool(self._paths))
+        self._clear.setEnabled(True)
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        """Closing the window must always work.
+
+        The run is asked to stop and given a short moment to notice; then the
+        window closes whatever happened. Nothing here can refuse the close -
+        that was the explicit requirement.
+        """
+        if self._thread is not None:
+            self._cancel.set()
+            self._thread.quit()
+            self._thread.wait(CLOSE_WAIT_MS)
+        event.accept()
 
     def _on_open_folder(self) -> None:
-        QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.abspath(self._out_dir.text())))
+        # The run's own folder, not the parent: that is where this run's
+        # stills and report actually are.
+        folder = self._run_dir or self._out_dir.text()
+        QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.abspath(folder)))
 
     def _on_open_report(self) -> None:
         if self._report_path:

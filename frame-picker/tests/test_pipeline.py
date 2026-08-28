@@ -169,9 +169,13 @@ def test_cancelling_mid_batch_removes_the_frames_already_written(normal_clip, bl
 
     def on_message(text: str) -> None:
         # Cancel as soon as the first clip has finished exporting, so there
-        # really are JPEGs on disk when the cleanup runs.
+        # really are JPEGs on disk when the cleanup runs. The run writes into
+        # its own dated subfolder, which is where those JPEGs are.
         if text.startswith(S.clip_done("", 0, 0, 0.0).split(":")[0]) and not cancel.is_set():
-            written.append(sorted(os.listdir(out_dir)))
+            for entry in sorted(os.listdir(out_dir)):
+                folder = os.path.join(out_dir, entry)
+                if os.path.isdir(folder):
+                    written.append(sorted(os.listdir(folder)))
             cancel.set()
 
     result = run_batch(
@@ -183,6 +187,7 @@ def test_cancelling_mid_batch_removes_the_frames_already_written(normal_clip, bl
 
     assert result.cancelled is True
     assert written and any(name.endswith(".jpg") for name in written[0]), written
+    # Nothing survives: neither the frames nor the folder the run created.
     assert sorted(os.listdir(out_dir)) == []
 
 
@@ -472,3 +477,175 @@ def test_normalisation_strength_dials_it_down():
 
     assert drift(off) == 0.0
     assert 0.0 < drift(half) < drift(full)
+
+
+# --------------------------------------------------------------------------
+# Its own folder per run, and the links in the page
+# --------------------------------------------------------------------------
+
+
+@requires_ffmpeg
+def test_each_run_writes_into_its_own_folder(normal_clip, tmp_path):
+    """Two runs into the same output directory must not mix.
+
+    The 163-file run reported 12 "files nothing refers to". They were the
+    previous run's stills, sitting in the same folder.
+    """
+    out = str(tmp_path / "out")
+    first = run_batch(Options(paths=[normal_clip], out_dir=out, per_clip=2, min_gap=1.0,
+                             select_mode=MODE_COUNT))
+    second = run_batch(Options(paths=[normal_clip], out_dir=out, per_clip=2, min_gap=1.0,
+                              select_mode=MODE_COUNT))
+
+    assert first.out_dir != second.out_dir
+    assert os.path.dirname(first.out_dir) == os.path.abspath(out)
+    for result in (first, second):
+        assert os.path.isfile(os.path.join(result.out_dir, report.REPORT_HTML))
+        assert result.results["integrity"]["unreferenced_files"] == []
+        assert result.results["output_dir"] == os.path.abspath(result.out_dir)
+
+
+@requires_ffmpeg
+def test_the_run_folder_can_be_turned_off(normal_clip, tmp_path):
+    out = str(tmp_path / "flat-out")
+    result = run_batch(Options(paths=[normal_clip], out_dir=out, per_clip=2, min_gap=1.0,
+                              select_mode=MODE_COUNT, run_folder=False))
+    assert os.path.abspath(result.out_dir) == os.path.abspath(out)
+
+
+@requires_ffmpeg
+def test_every_link_in_the_report_resolves(normal_clip, tmp_path):
+    result = _run([normal_clip], tmp_path, per_clip=3, min_gap=1.0, select_mode=MODE_COUNT)
+    links = result.results["integrity"]["links"]
+    assert links["checked"] > 0
+    assert links["broken"] == 0, links["details"]
+    assert result.results["integrity"]["ok"] is True
+
+
+@requires_ffmpeg
+def test_a_broken_link_in_the_report_is_reported(normal_clip, tmp_path):
+    """The check has to be able to fail, or it is not a check."""
+    result = _run([normal_clip], tmp_path, per_clip=2, min_gap=1.0, select_mode=MODE_COUNT)
+    html_path = os.path.join(result.out_dir, report.REPORT_HTML)
+    with open(html_path, "a", encoding="utf-8") as handle:
+        handle.write('<img src="does-not-exist.jpg">')
+    links = report.check_report_links(html_path, result.out_dir)
+    assert links["broken"] == 1
+    assert "does-not-exist.jpg" in links["details"][0]
+
+
+# --------------------------------------------------------------------------
+# The .LRF proxy, end to end
+# --------------------------------------------------------------------------
+
+
+@requires_ffmpeg
+def test_the_proxy_is_analysed_and_the_master_is_exported(tmp_path):
+    """Analysis on the 720p proxy; the exported still is full resolution."""
+    import cv2
+    from conftest import _make_clip
+
+    master = _make_clip(str(tmp_path / "DJI_0200_D.MP4"), 4, "scale=1280:720", fps=10)
+    built = _make_clip(str(tmp_path / "proxy-source.mp4"), 4, "scale=640:360", fps=10)
+    proxy = str(tmp_path / "DJI_0200_D.LRF")
+    os.replace(built, proxy)
+
+    result = run_batch(Options(paths=[master], out_dir=str(tmp_path / "out"), per_clip=2,
+                              min_gap=1.0, select_mode=MODE_COUNT))
+    clip = result.results["clips"][0]
+    assert clip["proxy"]["usable"] is True, clip["proxy"]["detail"]
+    assert clip["decode"]["proxy_file"] == "DJI_0200_D.LRF"
+    assert any("DJI_0200_D.LRF" in note for note in clip["notes"])
+
+    assert clip["frames"], "the proxy run still has to deliver frames"
+    exported = os.path.join(result.out_dir, clip["frames"][0]["file"])
+    image = cv2.imread(exported)
+    assert image is not None
+    assert image.shape[1] == 1280, "the export must come from the master, not the proxy"
+
+
+@requires_ffmpeg
+def test_the_proxy_can_be_turned_off(tmp_path):
+    from conftest import _make_clip
+
+    master = _make_clip(str(tmp_path / "DJI_0201_D.MP4"), 3, "scale=1280:720", fps=10)
+    built = _make_clip(str(tmp_path / "p.mp4"), 3, "scale=640:360", fps=10)
+    os.replace(built, str(tmp_path / "DJI_0201_D.LRF"))
+
+    result = run_batch(Options(paths=[master], out_dir=str(tmp_path / "out"), per_clip=1,
+                              min_gap=1.0, select_mode=MODE_COUNT, proxy="off"))
+    clip = result.results["clips"][0]
+    assert clip["proxy"] is None
+    assert clip["decode"]["proxy_file"] == ""
+
+
+# --------------------------------------------------------------------------
+# The camera's own word about the profile
+# --------------------------------------------------------------------------
+
+
+CAPTION_LINE = (
+    "1\n00:00:00,000 --> 00:00:00,100\n"
+    "<font size=\"28\">FrameCnt: 1, DiffTime: 100ms\n2026-08-22 19:13:45.123\n"
+    "[iso: 100] [shutter: 1/500.0] [color_md: {mode}] [focal_len: 24.00]</font>\n\n"
+)
+
+
+@requires_ffmpeg
+def test_a_normal_colour_clip_keeps_the_lut_off(tmp_path, monkeypatch):
+    """The mixed dump: the sidecar says Normal, so the LUT must not be applied."""
+    from conftest import _make_clip
+
+    clip_path = _make_clip(str(tmp_path / "DJI_0300_D.MP4"), 3, fps=10)
+    (tmp_path / "DJI_0300_D.SRT").write_text(CAPTION_LINE.format(mode="default"), encoding="utf-8")
+    lut = tmp_path / "identity.cube"
+    lut.write_text("LUT_3D_SIZE 2\n0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n1 1 1\n",
+                   encoding="utf-8")
+
+    result = run_batch(Options(paths=[clip_path], out_dir=str(tmp_path / "out"), per_clip=1,
+                              min_gap=1.0, select_mode=MODE_COUNT, lut=str(lut)))
+    clip = result.results["clips"][0]
+    assert clip["log"]["source"] == "sidecar"
+    assert clip["log"]["is_log"] is False
+    assert clip["log"]["is_a_guess"] is False
+    assert clip["color"]["mode"] == "none"
+    assert clip["color"]["lut"] is None
+
+
+@requires_ffmpeg
+def test_a_dlog_sidecar_turns_the_lut_on(tmp_path):
+    from conftest import _make_clip
+
+    clip_path = _make_clip(str(tmp_path / "DJI_0301_D.MP4"), 3, fps=10)
+    (tmp_path / "DJI_0301_D.SRT").write_text(CAPTION_LINE.format(mode="dlog_m"), encoding="utf-8")
+    lut = tmp_path / "identity.cube"
+    lut.write_text("LUT_3D_SIZE 2\n0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n1 1 1\n",
+                   encoding="utf-8")
+
+    result = run_batch(Options(paths=[clip_path], out_dir=str(tmp_path / "out"), per_clip=1,
+                              min_gap=1.0, select_mode=MODE_COUNT, lut=str(lut)))
+    clip = result.results["clips"][0]
+    assert clip["log"]["is_log"] is True
+    assert clip["log"]["profile"] == "dlog"
+    assert clip["color"]["mode"] == "lut"
+
+
+# --------------------------------------------------------------------------
+# --look auto, end to end
+# --------------------------------------------------------------------------
+
+
+@requires_ffmpeg
+def test_auto_look_decides_per_clip_and_records_the_evidence(normal_clip, tmp_path):
+    from framepicker import grading
+
+    result = _run([normal_clip], tmp_path, per_clip=2, min_gap=1.0, select_mode=MODE_COUNT,
+                  look=grading.AUTO)
+    clip = result.results["clips"][0]
+    look = clip["look"]
+    assert look["requested"] == grading.AUTO
+    assert look["name"] in grading.available()
+    assert look["name"] != grading.AUTO, "auto has to resolve to a real answer"
+    assert look["auto"] is not None
+    assert look["auto"]["frames_measured"] > 0
+    assert set(look["auto"]["evidence"]) >= {"vegetation", "sky", "warm", "grey", "vertical_share"}

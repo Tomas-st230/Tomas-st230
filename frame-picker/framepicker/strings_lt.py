@@ -254,8 +254,13 @@ def reason_faces_unknown() -> str:
     return "veidų duomenų nėra (aptikimas neveikia)"
 
 
-def reason_sharpness_rank(percentile: float) -> str:
-    return f"ryškumas — {percentile:.0f}-as procentilis šiame įraše"
+def reason_sharpness_rank(percentile: float, measured: float | None = None) -> str:
+    text = f"ryškumas — {percentile:.0f}-as procentilis šiame įraše"
+    if measured is not None:
+        # Percentilis rodo vietą įraše, o šis skaičius — patį išmatuotą dydį,
+        # kad kadrus būtų galima palyginti ir tarp skirtingų įrašų.
+        text += f" (išmatuota {measured:.1f})"
+    return text
 
 
 def reason_colorfulness_rank(percentile: float) -> str:
@@ -288,6 +293,21 @@ def reason_composition_unknown() -> str:
 
 def reason_component(name: str, value: float) -> str:
     return f"{name}: {value:.2f}"
+
+
+def reason_technical_gate(percentile: float) -> str:
+    """Kodėl „technika“ dažnai lygi 1.00, nors ryškumo procentilis skiriasi."""
+    return (
+        f"technika yra riba, ne skalė: nuo {percentile:.0f}-o ryškumo procentilio "
+        "balas nebekyla — už papildomą ryškumą kadras negauna nieko"
+    )
+
+
+def reason_moment_capped(cap: float) -> str:
+    return (
+        f"momentas be žmonių kadre ribojamas iki {cap:.2f} — judantis kadras be "
+        "objekto vertinamas mažiau nei judantis kadras su žmogumi"
+    )
 
 
 def reason_horizon_tilt(degrees: float) -> str:
@@ -365,6 +385,7 @@ def threshold_capped(kept: int) -> str:
 
 LOOK_NAMES = {
     "none": "be profilio",
+    "auto": "automatiškai (pagal sceną)",
     "nature": "gamta",
     "city": "miestas",
 }
@@ -545,3 +566,96 @@ GUI_COLOR_NORMALISE = "normalizuota"
 GUI_COLOR_NONE = "be pakeitimų"
 GUI_DECODE_HW = "GPU (CUDA)"
 GUI_DECODE_CPU = "CPU"
+
+
+# --------------------------------------------------------------------------
+# Proxy (.LRF), caption sidecar (.SRT), automatic look, per-run folder
+# --------------------------------------------------------------------------
+
+
+def proxy_used(name: str, width: int, height: int) -> str:
+    return (
+        f"Analizei naudojamas gretimas peržiūros failas {name} ({width}x{height}). "
+        "Eksportuojami kadrai visada imami iš originalo."
+    )
+
+
+def proxy_rejected(name: str, detail: str) -> str:
+    return f"Peržiūros failas {name} nenaudojamas: {detail}."
+
+
+def color_mode_found(value: str, source: str) -> str:
+    return f"Kameros užrašuose ({source}) nurodytas spalvų režimas: color_md={value}."
+
+
+def color_mode_missing() -> str:
+    return (
+        "Gretimo .SRT failo su kameros užrašais nėra, todėl profilis nustatomas iš "
+        "kitų požymių (bitų gylio, metaduomenų, pavadinimo). Įjunkite drone „Video Captions“, "
+        "ir profilis bus žinomas tiksliai."
+    )
+
+
+def lut_profile_mismatch(profile: str) -> str:
+    return (
+        f"Šis failas atpažintas kaip {profile.upper()}, o LUT paprastai skirtas D-Log M. "
+        "Spalvos gali būti netikslios — patikrinkite bent vieną kadrą."
+    )
+
+
+def gpu_scale_on(scaler: str) -> str:
+    return (
+        f"Kadrai mažinami GPU ({scaler}), todėl į atmintį kopijuojami jau maži. "
+        "Tai didžiausias dekodavimo laiko taupymas 4K medžiagoje."
+    )
+
+
+def gpu_scale_off(detail: str) -> str:
+    text = "GPU mažinimas neprieinamas, kadrai mažinami procesoriuje"
+    return f"{text}: {detail}." if detail else f"{text}."
+
+
+def keyframes_only(frames: int, fps: float) -> str:
+    return (
+        f"Dekoduoti tik atskaitos kadrai (keyframes): {frames} kadrų, "
+        f"tankis apie {fps:.2f}/s. Greita, bet tinklelį nustato kamera, ne nustatymai."
+    )
+
+
+def look_auto_decided(name: str, nature: float, city: float, frames: int) -> str:
+    return (
+        f"Automatiškai parinktas profilis „{LOOK_NAMES.get(name, name)}“ "
+        f"(gamta {nature:.2f} / miestas {city:.2f}, išmatuota {frames} kadr.)."
+    )
+
+
+def look_auto_undecided(nature: float | None, city: float | None, margin: float) -> str:
+    if nature is None or city is None:
+        return "Automatinis profilis nenustatytas: nebuvo ką išmatuoti. Profilis netaikomas."
+    return (
+        f"Automatinis profilis nenustatytas: gamta {nature:.2f} ir miestas {city:.2f} "
+        f"skiriasi mažiau nei {margin:.2f}. Profilis netaikomas — tai sąmoningas atsakymas, "
+        "o ne klaida."
+    )
+
+
+def run_folder_created(path: str) -> str:
+    return f"Šio paleidimo rezultatai rašomi į atskirą aplanką: {path}"
+
+
+def integrity_links(checked: int, broken: int) -> str:
+    if broken:
+        return f"Ataskaitos sąsajos: patikrinta {checked}, neveikia {broken}."
+    return f"Ataskaitos sąsajos: patikrinta {checked}, visos veikia."
+
+
+GUI_LOOK_AUTO_HINT = (
+    "„Automatiškai“ išmatuoja kiekvieno failo scenas (žalumas, dangus, šiluma, "
+    "pilkos plokštumos, vertikalios linijos) ir parenka „gamta“ arba „miestas“. "
+    "Kai požymiai per artimi, profilis netaikomas."
+)
+GUI_COL_LOOK = "Profilis"
+GUI_STOPPING = "Stabdoma…"
+GUI_RESET = "Pradėti iš naujo"
+GUI_BUSY = "Vykdoma — naujų failų kelti negalima"
+GUI_RUN_DIR = "Šio paleidimo aplankas"

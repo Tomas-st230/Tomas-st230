@@ -477,3 +477,117 @@ def extract(
             result["thirds_distance"] = thirds_distance(cx, cy)
     result["horizon_tilt"] = horizon_tilt(frame)
     return result
+
+
+# --------------------------------------------------------------------------
+# Scene signature: what kind of place is this?
+# --------------------------------------------------------------------------
+#
+# Measurements only. The decision built on top of them lives in
+# :mod:`framepicker.grading`, so the two can be argued with separately.
+#
+# OpenCV puts hue in 0..179 (degrees / 2). The bands below are wide on
+# purpose: they are meant to separate "vegetation, water and sky" from
+# "concrete, asphalt and glass", not to identify a species of tree.
+
+#: Green band: 60..150 degrees.
+HUE_VEGETATION = (30, 75)
+#: Blue band: 180..260 degrees - sky and water.
+HUE_SKY = (90, 130)
+#: Warm band: red through orange, wrapping around 0.
+HUE_WARM_LOW = (0, 22)
+HUE_WARM_HIGH = (168, 179)
+#: A pixel below this saturation carries no hue worth counting.
+SCENE_MIN_SATURATION = 40
+#: A pixel below this value is too dark to be classified at all.
+SCENE_MIN_VALUE = 40
+#: Grey band: unsaturated and neither black nor blown out.
+SCENE_GREY_MAX_SATURATION = 40
+SCENE_GREY_VALUE = (50, 215)
+#: How far from vertical a line may lean and still count as vertical.
+VERTICAL_DEGREES = 15.0
+#: Fewer lines than this and the vertical share is not a measurement.
+VERTICAL_MIN_LINES = 4
+
+
+def scene_signature(frame: np.ndarray) -> dict:
+    """Colour and structure shares of one frame.
+
+    Every value is a fraction of the frame (0..1) except ``vertical_share``,
+    which is a fraction of the straight lines found and is ``None`` when too
+    few lines were found to divide by.
+    """
+    import cv2
+
+    arr = np.ascontiguousarray(np.asarray(frame, dtype=np.uint8))
+    hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
+    hue, sat, val = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+    coloured = (sat >= SCENE_MIN_SATURATION) & (val >= SCENE_MIN_VALUE)
+    total = float(hue.size)
+
+    def band(low: int, high: int) -> np.ndarray:
+        return (hue >= low) & (hue <= high) & coloured
+
+    vegetation = float(band(*HUE_VEGETATION).sum() / total)
+    sky = float(band(*HUE_SKY).sum() / total)
+    warm = float((band(*HUE_WARM_LOW) | band(*HUE_WARM_HIGH)).sum() / total)
+    grey = float((
+        (sat < SCENE_GREY_MAX_SATURATION)
+        & (val >= SCENE_GREY_VALUE[0])
+        & (val <= SCENE_GREY_VALUE[1])
+    ).sum() / total)
+
+    return {
+        "vegetation": vegetation,
+        "sky": sky,
+        "warm": warm,
+        "grey": grey,
+        "vertical_share": vertical_line_share(frame),
+    }
+
+
+def vertical_line_share(frame: np.ndarray) -> float | None:
+    """Share of the straight lines in *frame* that stand up.
+
+    Buildings, poles and windows give vertical lines; a coastline, a forest
+    and a field do not. ``None`` when fewer than
+    :data:`VERTICAL_MIN_LINES` lines were found, because a share of three
+    lines is not evidence of anything.
+    """
+    import cv2
+
+    luma = to_luma(frame).astype(np.uint8)
+    blurred = cv2.GaussianBlur(luma, (5, 5), 0)
+    median = float(np.median(blurred))
+    low = int(max(10.0, 0.66 * median))
+    high = int(min(255.0, max(low + 10.0, 1.33 * median)))
+    edges = cv2.Canny(blurred, low, high)
+
+    height, width = edges.shape[:2]
+    lines = cv2.HoughLinesP(
+        edges, 1, np.pi / 360.0,
+        threshold=40,
+        minLineLength=int(min(height, width) * 0.20),
+        maxLineGap=max(2, int(width * 0.02)),
+    )
+    if lines is None or len(lines) == 0:
+        return None
+
+    vertical = 0
+    counted = 0
+    for entry in lines:
+        values = np.asarray(entry, dtype=np.float64).ravel()
+        if values.size < 4:
+            continue
+        x1, y1, x2, y2 = values[:4]
+        if np.hypot(x2 - x1, y2 - y1) <= 0:
+            continue
+        counted += 1
+        angle = abs(float(np.degrees(np.arctan2(y2 - y1, x2 - x1))))
+        if angle > 90.0:
+            angle = 180.0 - angle
+        if angle >= 90.0 - VERTICAL_DEGREES:
+            vertical += 1
+    if counted < VERTICAL_MIN_LINES:
+        return None
+    return vertical / float(counted)

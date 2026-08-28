@@ -16,11 +16,11 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Callable, Sequence
 
-from . import decode, export, features, grading, keepawake, proc, report, scoring
+from . import decode, export, features, grading, keepawake, proc, report, scoring, sidecar
 from . import strings_lt as S
 from .probe import ProbeError, probe
 from .select import (
@@ -35,6 +35,15 @@ from .select import (
 VERSION = "0.1.0"
 
 DEFAULT_OUT_DIR = "frame-picker-out"
+#: Where the footage normally lives on Tomas's machine. Used only as a
+#: starting point: if the folder is not there, nothing about it is assumed.
+DEFAULT_SOURCE_DIR = r"D:\tomas\Videos\DJI Drone foot"
+#: Every run gets its own folder under the output directory, named after the
+#: moment it started. Without this, a second run drops its stills next to the
+#: first run's and the check at the end reports files nothing refers to -
+#: which is exactly what happened on the 163-file run: 12 stale frames.
+RUN_DIR_PREFIX = "run-"
+RUN_DIR_TIME_FORMAT = "%Y%m%d-%H%M%S"
 DEFAULT_PER_CLIP = 6
 #: Frames of the whole batch on the "best of the batch" page. On by default;
 #: the page is labelled less reliable than the per-clip ranking, because it
@@ -57,6 +66,41 @@ VIDEO_SUFFIXES = (
     ".mp4", ".mov", ".mxf", ".mkv", ".avi", ".m4v", ".mts", ".m2ts", ".insv", ".webm",
 )
 
+#: Analysis may run on DJI's ``.LRF`` proxy instead of the master file.
+PROXY_AUTO = "auto"
+PROXY_OFF = "off"
+
+
+def default_source_dir() -> str | None:
+    """The usual footage folder, or ``None`` when it does not exist here."""
+    return DEFAULT_SOURCE_DIR if os.path.isdir(DEFAULT_SOURCE_DIR) else None
+
+
+def default_out_dir() -> str:
+    """Output next to the footage when the usual folder exists, else here."""
+    source = default_source_dir()
+    return os.path.join(source, DEFAULT_OUT_DIR) if source else DEFAULT_OUT_DIR
+
+
+def run_directory(out_dir: str, enabled: bool = True, when: datetime | None = None) -> str:
+    """Path of the folder this run writes into.
+
+    A run never shares a folder with another run unless that is asked for:
+    mixing them makes the integrity check report the previous run's frames as
+    unreferenced files, and makes the folder unusable as a deliverable.
+    """
+    if not enabled:
+        return out_dir
+    stamp = (when or datetime.now()).strftime(RUN_DIR_TIME_FORMAT)
+    base = os.path.join(out_dir, f"{RUN_DIR_PREFIX}{stamp}")
+    candidate = base
+    suffix = 2
+    while os.path.exists(candidate):
+        candidate = f"{base}-{suffix}"
+        suffix += 1
+    return candidate
+
+
 #: A frame this uniformly black or white is thrown away before any real work.
 CHEAP_REJECT_CLIP_FRACTION = 0.90
 #: Sharpness percentile below which a frame is rejected as soft, for this clip.
@@ -66,7 +110,7 @@ CHEAP_REJECT_SHARPNESS_QUANTILE = 0.10
 @dataclass
 class Options:
     paths: list[str] = field(default_factory=list)
-    out_dir: str = DEFAULT_OUT_DIR
+    out_dir: str = field(default_factory=default_out_dir)
     per_clip: int = DEFAULT_PER_CLIP
     fps: float = DEFAULT_FPS
     min_gap: float = DEFAULT_MIN_GAP
@@ -89,6 +133,10 @@ class Options:
     min_score: float = DEFAULT_MIN_SCORE
     max_per_clip: int = DEFAULT_MAX_PER_CLIP
     export_height: int = 0
+    proxy: str = PROXY_AUTO
+    keyframes: bool = False
+    gpu_scale: bool = True
+    run_folder: bool = True
 
     def as_dict(self) -> dict:
         return {
@@ -114,6 +162,10 @@ class Options:
             "min_score": self.min_score,
             "max_per_clip": self.max_per_clip,
             "export_height": self.export_height,
+            "proxy": self.proxy,
+            "keyframes": self.keyframes,
+            "gpu_scale": self.gpu_scale,
+            "run_folder": self.run_folder,
         }
 
 
@@ -219,17 +271,50 @@ def analyse_clip(
         "rejects": {"total": 0, "dark": 0, "bright": 0, "blurry": 0},
     }
 
+    # -- proxy -------------------------------------------------------------
+    # DJI writes a 720p .LRF next to every take. Analysis runs at 640 px, so
+    # the proxy carries the same information for a fraction of the decoding
+    # work; the exported stills always come from the master file.
+    analysis_clip = clip
+    proxy = None
+    if options.proxy != PROXY_OFF:
+        found = sidecar.find_proxy(path)
+        if found:
+            # A proxy is only useful if it is at least as big as the frames
+            # the analysis would have used anyway.
+            needed = min(decode.ANALYSIS_LONG_EDGE, max(int(clip.width or 0), int(clip.height or 0)))
+            proxy = sidecar.check_proxy(clip, found, needed)
+            if proxy.usable:
+                try:
+                    analysis_clip = probe(proxy.path)
+                    _note(record, messenger, S.proxy_used(
+                        os.path.basename(proxy.path), proxy.width or 0, proxy.height or 0))
+                except ProbeError as exc:
+                    proxy = sidecar.Proxy(found, False, str(exc))
+            if not proxy.usable:
+                _note(record, messenger, S.proxy_rejected(
+                    os.path.basename(proxy.path), proxy.detail))
+    record["proxy"] = proxy.as_dict() if proxy is not None else None
+
     # -- colour ------------------------------------------------------------
-    # Sample a handful of frames first: the flatness measurement is the only
-    # log signal left when the camera tags nothing and the filename says
-    # nothing, which is the normal case for DJI files.
+    # What the camera itself said, if it said anything: the caption sidecar is
+    # the only place the picture profile appears in words.
+    color_mode = sidecar.read_color_mode(path)
+    if color_mode is not None:
+        _note(record, messenger, S.color_mode_found(
+            color_mode.value, os.path.basename(color_mode.source)))
+    else:
+        messenger.once("color-mode-missing", S.color_mode_missing())
+
+    # Then sample a handful of frames: measured flatness is reported as
+    # evidence, and is the last thing left when nothing else says anything.
     samples: list = []
     stats = None
     if options.convert_log != "off":
-        samples = decode.sample_for_normalisation(clip)
+        samples = decode.sample_for_normalisation(analysis_clip)
         stats = decode.flatness(samples)
 
-    verdict = decode.detect_log(clip, options.convert_log, stats)
+    verdict = decode.detect_log(clip, options.convert_log, stats, color_mode)
     record["log"] = verdict.as_dict()
     log_line = (
         S.log_detected(_log_source_text(verdict.source)) if verdict.is_log
@@ -267,6 +352,10 @@ def analyse_clip(
             # log verdict unless the user forces it onto everything.
             lut_path = options.lut
             _note(record, messenger, S.lut_applied(options.lut))
+            if verdict.profile == "hlg":
+                # A D-Log LUT on HLG footage is the wrong conversion. Said out
+                # loud rather than silently applied.
+                _note(record, messenger, S.lut_profile_mismatch(verdict.profile))
             if options.lut_all and not verdict.is_log:
                 _note(record, messenger, S.lut_forced_on_all())
         else:
@@ -313,12 +402,16 @@ def analyse_clip(
     timestamps: list[float] = []
     cheap: list[dict] = []
     previous_frame = None
+    if proxy is not None and proxy.usable:
+        decode_report.proxy_file = os.path.basename(proxy.path)
     for timestamp, frame in decode.sample_frames(
-        clip,
+        analysis_clip,
         options.fps,
         lut_path=lut_path,
         hwaccel=options.hwaccel,
         max_candidates=options.max_candidates,
+        keyframes_only=options.keyframes,
+        gpu_scale=options.gpu_scale,
         cancel=cancel,
         report=decode_report,
     ):
@@ -343,6 +436,13 @@ def analyse_clip(
     record["decode"] = decode_report.as_dict()
     messenger.say(S.decode_path_hw() if decode_report.path_used == "hw"
                   else S.decode_path_cpu(decode_report.hw_error))
+    if decode_report.gpu_scaler:
+        messenger.once("gpu-scale", S.gpu_scale_on(decode_report.gpu_scaler))
+    elif decode_report.path_used == "hw":
+        messenger.once("gpu-scale-off", S.gpu_scale_off(decode_report.gpu_scale_error))
+    if decode_report.keyframes_only:
+        _note(record, messenger, S.keyframes_only(
+            decode_report.frames_yielded, decode_report.effective_fps))
     messenger.say(S.sampled_frames(len(cheap), decode_report.frames_expected, decode_report.effective_fps))
     if decode_report.frames_expected and len(cheap) < decode_report.frames_expected * 0.9:
         messenger.say(S.sampling_shortfall(len(cheap), decode_report.frames_expected))
@@ -436,6 +536,40 @@ def analyse_clip(
         for reason in selection.reasons:
             messenger.say(reason)
 
+    # -- look --------------------------------------------------------------
+    # Decided once per clip, on frames spread across it: a look that changed
+    # from shot to shot inside one take would be worse than none. The decision
+    # is made on the analysis frames *after* the conversion, so it sees the
+    # same colours the export will.
+    look_name = options.look
+    auto_choice = None
+    if options.look == grading.AUTO:
+        signatures: list[dict] = []
+        if survivors:
+            step = max(1, len(survivors) // grading.AUTO_SAMPLE)
+            for i in survivors[::step][:grading.AUTO_SAMPLE]:
+                frame = _decode_buffer(buffers[i])
+                if frame is not None:
+                    signatures.append(features.scene_signature(frame))
+        auto_choice = grading.classify_frames(signatures)
+        look_name = auto_choice["choice"]
+        if auto_choice["decided"]:
+            _note(record, messenger, S.look_auto_decided(
+                look_name, auto_choice["nature_score"], auto_choice["city_score"],
+                auto_choice["frames_measured"]))
+        else:
+            _note(record, messenger, S.look_auto_undecided(
+                auto_choice["nature_score"], auto_choice["city_score"],
+                grading.AUTO_MARGIN))
+    look = grading.get(look_name)
+    record["look"] = {
+        "requested": options.look,
+        "name": look_name,
+        "strength": options.look_strength,
+        "definition": look.as_dict() if look else None,
+        "auto": auto_choice,
+    }
+
     # -- export ------------------------------------------------------------
     if cancel is None or not cancel.is_set():
         results, errors = export.export_selection(
@@ -448,7 +582,7 @@ def analyse_clip(
             quality=options.jpeg_quality,
             image_format=options.image_format,
             height=options.export_height,
-            look=grading.get(options.look),
+            look=look,
             look_strength=options.look_strength,
             cancel=cancel,
         )
@@ -456,10 +590,7 @@ def analyse_clip(
             S.export_resolution_scaled(options.export_height) if options.export_height
             else S.export_resolution_native()
         )
-        look = grading.get(options.look)
-        record["look"] = {"name": options.look, "strength": options.look_strength,
-                          "definition": look.as_dict() if look else None}
-        _note(record, messenger, S.look_applied(options.look, options.look_strength)
+        _note(record, messenger, S.look_applied(look_name, options.look_strength)
               if look else S.look_none())
         for text in errors:
             messenger.say(text)
@@ -573,7 +704,7 @@ def clip_summary(index: int, path: str, record: dict | None, reason: str = "") -
         return {
             "index": index, "path": path, "name": os.path.basename(path), "ok": False,
             "is_log": None, "log_source": "", "color_mode": "", "decode_path": "",
-            "frames": 0, "elapsed_s": 0.0, "reason": reason,
+            "look": "", "proxy": "", "frames": 0, "elapsed_s": 0.0, "reason": reason,
         }
     log = record.get("log", {})
     return {
@@ -584,6 +715,8 @@ def clip_summary(index: int, path: str, record: dict | None, reason: str = "") -
         "is_log": log.get("is_log"),
         "log_source": log.get("source", ""),
         "color_mode": record.get("color", {}).get("mode", ""),
+        "look": record.get("look", {}).get("name", ""),
+        "proxy": (record.get("proxy") or {}).get("file", "") if record.get("proxy") else "",
         "decode_path": record.get("decode", {}).get("path_used", ""),
         "frames": len(record.get("frames", [])),
         "elapsed_s": float(record.get("elapsed_s") or 0.0),
@@ -621,7 +754,13 @@ def run_batch(
         messenger.say(S.no_input_files())
         return BatchResult({}, options.out_dir, messages=messenger.log)
 
-    os.makedirs(options.out_dir, exist_ok=True)
+    # Its own folder for this run, created here and reported. Every path below
+    # is inside it, so a second run can never overwrite or pollute the first.
+    run_dir = run_directory(options.out_dir, options.run_folder)
+    os.makedirs(run_dir, exist_ok=True)
+    if options.run_folder:
+        messenger.say(S.run_folder_created(os.path.abspath(run_dir)))
+    clip_options = replace(options, out_dir=run_dir)
 
     clips: list[dict | None] = [None] * len(paths)
     skipped: list[dict] = [{"path": m, "reason": S.input_not_found(m)} for m in unmatched]
@@ -632,7 +771,7 @@ def run_batch(
             return
         messenger.say(S.processing_file(index + 1, len(paths), os.path.basename(path)))
         try:
-            clips[index] = analyse_clip(path, options, messenger, created, cancel)
+            clips[index] = analyse_clip(path, clip_options, messenger, created, cancel)
             if on_clip_done is not None:
                 on_clip_done(clip_summary(index, path, clips[index]))
         except ProbeError as exc:
@@ -670,6 +809,7 @@ def run_batch(
     results = {
         "tool": "frame-picker",
         "version": VERSION,
+        "output_dir": os.path.abspath(run_dir),
         "generated": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
         "options": options.as_dict(),
         "weights": dict(scoring.WEIGHTS),
@@ -698,28 +838,44 @@ def run_batch(
 
     if cancel is not None and cancel.is_set():
         created.remove_all()
-        messenger.say(S.cancelled_cleanup(options.out_dir))
-        return BatchResult(results, options.out_dir, cancelled=True, messages=messenger.log)
+        # The run's own folder goes too, when this run is what created it and
+        # nothing else ended up in it. Cancelling has to leave no trace, so
+        # that loading a new set of files starts from a clean state.
+        if options.run_folder:
+            try:
+                if not os.listdir(run_dir):
+                    os.rmdir(run_dir)
+            except OSError:
+                pass
+        messenger.say(S.cancelled_cleanup(run_dir))
+        return BatchResult(results, run_dir, cancelled=True, messages=messenger.log)
 
     # Build every preview first, so a preview that cannot be produced becomes a
     # named finding instead of a silent gap in the page, then check the whole
     # output before writing anything final.
-    previews = report.build_previews(results, options.out_dir)
-    results["integrity"] = report.verify(results, options.out_dir, previews)
+    previews = report.build_previews(results, run_dir)
+    results["integrity"] = report.verify(results, run_dir, previews)
     for text in results["integrity"]["messages"]:
         messenger.say(text)
 
-    json_path = report.write_results_json(results, options.out_dir)
+    json_path = report.write_results_json(results, run_dir)
     created.add(json_path)
-    html_path = report.write_report_html(results, options.out_dir, previews)
+    html_path = report.write_report_html(results, run_dir, previews)
     created.add(html_path)
     results["integrity"]["report_files"] = S.integrity_report_files(
         os.path.isfile(json_path) and os.path.getsize(json_path) > 0,
         os.path.isfile(html_path) and os.path.getsize(html_path) > 0,
     )
     messenger.say(results["integrity"]["report_files"])
+    # And the page's own links, read back off disk rather than assumed.
+    links = report.check_report_links(html_path, run_dir)
+    results["integrity"]["links"] = links
+    results["integrity"]["ok"] = results["integrity"]["ok"] and links["broken"] == 0
+    messenger.say(S.integrity_links(links["checked"], links["broken"]))
+    for detail in links["details"][:10]:
+        messenger.say(detail)
     # results.json is rewritten so it carries the check on the report files too.
-    report.write_results_json(results, options.out_dir)
+    report.write_results_json(results, run_dir)
 
     if options.select_mode == MODE_THRESHOLD:
         messenger.say(S.batch_summary_threshold(
@@ -734,9 +890,9 @@ def run_batch(
             messenger.say(S.probe_failed(os.path.basename(item["path"]), item["reason"]))
     if footage_seconds > 0:
         messenger.say(S.throughput(elapsed / (footage_seconds / 60.0)))
-    messenger.say(S.output_written(os.path.abspath(options.out_dir)))
+    messenger.say(S.output_written(os.path.abspath(run_dir)))
 
-    return BatchResult(results, options.out_dir, json_path, html_path, messages=messenger.log)
+    return BatchResult(results, run_dir, json_path, html_path, messages=messenger.log)
 
 
 def _global_top(clips: Sequence[dict], count: int) -> list[dict]:
@@ -765,7 +921,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("videos", nargs="*",
                         help="video files, folders, or wildcards such as D:/clips/*.MP4")
-    parser.add_argument("--out", dest="out_dir", default=DEFAULT_OUT_DIR, help="output directory")
+    parser.add_argument("--out", dest="out_dir", default=default_out_dir(),
+                        help="output directory; every run gets its own subfolder inside it")
+    parser.add_argument("--no-run-folder", dest="run_folder", action="store_false",
+                        help="write straight into --out instead of a per-run subfolder")
     parser.add_argument("--per-clip", type=int, default=DEFAULT_PER_CLIP,
                         help="frames to pick per clip (count mode only)")
     parser.add_argument("--select", dest="select_mode", choices=(MODE_THRESHOLD, MODE_COUNT),
@@ -806,6 +965,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-candidates", type=int, default=DEFAULT_MAX_CANDIDATES,
                         help="upper bound on analysis frames buffered per clip")
     parser.add_argument("--hwaccel", default="auto", help="hardware decoder to try ('auto', 'cuda', 'none')")
+    parser.add_argument("--no-gpu-scale", dest="gpu_scale", action="store_false",
+                        help="do not scale on the GPU even when the build supports it")
+    parser.add_argument("--proxy", choices=(PROXY_AUTO, PROXY_OFF), default=PROXY_AUTO,
+                        help="use a DJI .LRF proxy for analysis when one sits next to the file")
+    parser.add_argument("--keyframes", action="store_true",
+                        help="decode only keyframes: much faster, and the sampling grid "
+                             "becomes the camera's keyframe interval")
     parser.add_argument("--order", choices=(ORDER_DATE, ORDER_NAME, ORDER_NONE), default=ORDER_DATE,
                         help="processing order: 'date' = oldest file first (default), "
                              "'name' = by filename, 'none' = as given")
@@ -839,6 +1005,10 @@ def options_from_args(args: argparse.Namespace) -> Options:
         min_score=args.min_score,
         max_per_clip=args.max_per_clip,
         export_height=args.export_height,
+        proxy=args.proxy,
+        keyframes=args.keyframes,
+        gpu_scale=args.gpu_scale,
+        run_folder=args.run_folder,
     )
 
 

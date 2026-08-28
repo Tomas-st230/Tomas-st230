@@ -13,6 +13,7 @@ import datetime as _dt
 import html
 import json
 import os
+import re
 from typing import Iterable
 
 from . import strings_lt as S
@@ -167,6 +168,50 @@ def verify(results: dict, out_dir: str, previews: dict[str, str]) -> dict:
         "unreferenced_files": orphans,
         "messages": messages,
     }
+
+
+#: ``src="..."`` and ``href="..."`` in the written page.
+_LINK = re.compile(r'(?:src|href)\s*=\s*"([^"]+)"', re.IGNORECASE)
+
+
+def check_report_links(html_path: str, out_dir: str) -> dict:
+    """Open the written page and check that every link in it resolves.
+
+    Asked for directly: "check that everything has its links". The page is
+    self-contained, so most links are ``data:`` URIs - those are checked by
+    decoding them, because an empty or truncated image is a broken link that
+    still looks like markup.
+    """
+    try:
+        with open(html_path, "r", encoding="utf-8") as handle:
+            document = handle.read()
+    except OSError as exc:
+        return {"checked": 0, "broken": 1, "details": [f"{os.path.basename(html_path)}: {exc}"],
+                "external": 0}
+
+    checked = 0
+    external = 0
+    details: list[str] = []
+    for target in _LINK.findall(document):
+        if target.startswith("data:"):
+            checked += 1
+            head, _, payload = target.partition(",")
+            if not payload:
+                details.append("data: link with no content")
+                continue
+            if "base64" in head:
+                try:
+                    if not base64.b64decode(payload, validate=False):
+                        details.append("data: link decodes to nothing")
+                except Exception:  # noqa: BLE001 - any decode failure is a broken link
+                    details.append("data: link does not decode")
+        elif target.startswith(("http://", "https://", "mailto:", "#")):
+            external += 1
+        else:
+            checked += 1
+            if not os.path.isfile(os.path.join(out_dir, target)):
+                details.append(f"{target}: file not found")
+    return {"checked": checked, "broken": len(details), "details": details, "external": external}
 
 
 def _preview_data_uri(path: str, long_edge: int = PREVIEW_LONG_EDGE) -> str | None:
