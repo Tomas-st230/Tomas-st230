@@ -111,6 +111,20 @@ python -m framepicker VIDEO... [--out DIR] [--per-clip 6] [--fps 2]
                                [--lut path.cube] [--jobs N] [--no-faces]
 ```
 
+`VIDEO...` takes files, **folders**, or **wildcards**. The expansion happens
+inside the tool, not in the shell, because neither `cmd` nor PowerShell globs
+arguments for a Python program - `*.MP4` would otherwise arrive verbatim and
+match nothing:
+
+```powershell
+python -m framepicker "D:\video\DJI_0001.MP4" --out D:\pickai
+python -m framepicker D:\video --out D:\pickai
+python -m framepicker "D:\video\*.MP4" --out D:\pickai
+```
+
+An input that matches nothing is named in the console and listed in
+`results.json` under `skipped`; it is never silently dropped.
+
 | Flag | Default | Meaning |
 |---|---|---|
 | `--out` | `frame-picker-out` | output directory |
