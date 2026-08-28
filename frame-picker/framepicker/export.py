@@ -43,6 +43,21 @@ def output_name(clip_name: str, rank: int, timestamp: float, score: float, suffi
     return f"{safe_stem(clip_name)}_{rank:02d}_{timestamp:08.3f}s_{score:.3f}.{suffix}"
 
 
+def build_export_filter(lut_path: str | None, height: int = 0) -> str | None:
+    """Filter chain for the exported still, or ``None`` when nothing is needed.
+
+    *height* of 0 keeps the source resolution - 4K stays 4K, 2.7K stays 2.7K.
+    A non-zero *height* only ever scales **down**: a 1080p source asked for
+    1080p is left alone rather than upscaled.
+    """
+    parts: list[str] = []
+    if lut_path:
+        parts.append(f"lut3d=file='{escape_filter_path(lut_path)}'")
+    if height and height > 0:
+        parts.append(f"scale=-2:'min(ih,{int(height)})':flags=lanczos")
+    return ",".join(parts) if parts else None
+
+
 def export_frame(
     src: str,
     timestamp: float,
@@ -52,6 +67,7 @@ def export_frame(
     normalisation: Normalisation | None = None,
     quality: int = 2,
     image_format: str = "jpg",
+    height: int = 0,
 ) -> ExportResult:
     """Cut one frame out of *src* at *timestamp* and write it to *out_path*.
 
@@ -70,8 +86,9 @@ def export_frame(
         "-map", "0:v:0",
         "-frames:v", "1",
     ]
-    if lut_path:
-        argv += ["-vf", f"lut3d=file='{escape_filter_path(lut_path)}'"]
+    video_filter = build_export_filter(lut_path, height)
+    if video_filter:
+        argv += ["-vf", video_filter]
     if image_format.lower() in ("jpg", "jpeg"):
         argv += ["-q:v", str(int(quality))]
     argv += [out_path]
@@ -123,6 +140,7 @@ def export_selection(
     normalisation: Normalisation | None = None,
     quality: int = 2,
     image_format: str = "jpg",
+    height: int = 0,
     cancel=None,
 ) -> tuple[list[ExportResult], list[str]]:
     """Export every chosen candidate. Returns ``(results, error_messages)``."""
@@ -140,6 +158,7 @@ def export_selection(
             normalisation=normalisation,
             quality=quality,
             image_format=image_format,
+            height=height,
         )
         results.append(result)
         if not result.ok:

@@ -12,6 +12,7 @@ from framepicker import strings_lt as S
 from framepicker.cli import Options, run_batch
 from framepicker.decode import detect_log
 from framepicker.probe import probe
+from framepicker.select import MODE_COUNT, MODE_THRESHOLD
 
 from conftest import requires_ffmpeg
 
@@ -26,7 +27,8 @@ def _run(paths, tmp_path, **kwargs):
 @requires_ffmpeg
 def test_missing_detector_is_none_not_zero(normal_clip, tmp_path):
     """No YuNet model: face features stay None, the run continues, the report says so."""
-    result = _run([normal_clip], tmp_path, face_model=MISSING_MODEL, per_clip=3, min_gap=1.0)
+    result = _run([normal_clip], tmp_path, face_model=MISSING_MODEL, per_clip=3, min_gap=1.0,
+                  select_mode=MODE_COUNT)
 
     clip = result.results["clips"][0]
     assert clip["detectors"]["faces"]["available"] is False
@@ -45,7 +47,7 @@ def test_missing_detector_is_none_not_zero(normal_clip, tmp_path):
 @requires_ffmpeg
 def test_shortfall_is_reported(short_clip, tmp_path):
     """A five second clip asked for six frames returns fewer, with a reason."""
-    result = _run([short_clip], tmp_path, per_clip=6, min_gap=2.0)
+    result = _run([short_clip], tmp_path, per_clip=6, min_gap=2.0, select_mode=MODE_COUNT)
 
     clip = result.results["clips"][0]
     selection = clip["selection"]
@@ -63,7 +65,8 @@ def test_shortfall_is_reported(short_clip, tmp_path):
 @requires_ffmpeg
 def test_unreadable_file_does_not_abort_batch(normal_clip, unreadable_file, blurred_clip, tmp_path):
     """One bad file is named and skipped; the rest of the batch still runs."""
-    result = _run([unreadable_file, normal_clip, blurred_clip], tmp_path, per_clip=2, min_gap=1.0, jobs=1)
+    result = _run([unreadable_file, normal_clip, blurred_clip], tmp_path, per_clip=2, min_gap=1.0,
+                  jobs=1, select_mode=MODE_COUNT)
 
     assert len(result.results["clips"]) == 2
     assert len(result.results["skipped"]) == 1
@@ -92,8 +95,10 @@ def test_log_clip_is_not_penalised(flat_clip, normal_clip, tmp_path):
     assert verdict.is_log and verdict.source == "filename"
     assert verdict.is_a_guess is True
 
-    flat = _run([flat_clip], tmp_path / "flat", per_clip=3, min_gap=1.0).results["clips"][0]
-    normal = _run([normal_clip], tmp_path / "normal", per_clip=3, min_gap=1.0).results["clips"][0]
+    flat = _run([flat_clip], tmp_path / "flat", per_clip=3, min_gap=1.0,
+                select_mode=MODE_COUNT).results["clips"][0]
+    normal = _run([normal_clip], tmp_path / "normal", per_clip=3, min_gap=1.0,
+                  select_mode=MODE_COUNT).results["clips"][0]
 
     assert flat["color"]["mode"] == "normalise"
     assert S.normalisation_applied() in flat["notes"]
@@ -118,7 +123,7 @@ def test_log_clip_is_not_penalised(flat_clip, normal_clip, tmp_path):
 
 @requires_ffmpeg
 def test_sampling_count_is_measured_not_assumed(normal_clip, tmp_path):
-    result = _run([normal_clip], tmp_path, per_clip=2, fps=2.0, min_gap=1.0)
+    result = _run([normal_clip], tmp_path, per_clip=2, fps=2.0, min_gap=1.0, select_mode=MODE_COUNT)
     decode_report = result.results["clips"][0]["decode"]
     assert decode_report["frames_expected"] > 0
     assert decode_report["frames_yielded"] > 0
@@ -128,7 +133,7 @@ def test_sampling_count_is_measured_not_assumed(normal_clip, tmp_path):
 
 @requires_ffmpeg
 def test_report_and_json_are_written(normal_clip, tmp_path):
-    result = _run([normal_clip], tmp_path, per_clip=2, min_gap=1.0)
+    result = _run([normal_clip], tmp_path, per_clip=2, min_gap=1.0, select_mode=MODE_COUNT)
     assert os.path.isfile(os.path.join(result.out_dir, report.RESULTS_JSON))
     html_path = os.path.join(result.out_dir, report.REPORT_HTML)
     assert os.path.isfile(html_path)
@@ -144,7 +149,9 @@ def test_cancellation_deletes_partial_output(normal_clip, tmp_path):
     cancel = threading.Event()
     cancel.set()
     out_dir = str(tmp_path / "cancelled")
-    result = run_batch(Options(paths=[normal_clip], out_dir=out_dir, per_clip=3), cancel=cancel)
+    result = run_batch(
+        Options(paths=[normal_clip], out_dir=out_dir, per_clip=3, select_mode=MODE_COUNT), cancel=cancel
+    )
     assert result.cancelled is True
     leftovers = [n for n in os.listdir(out_dir)] if os.path.isdir(out_dir) else []
     assert leftovers == [], leftovers
@@ -167,7 +174,8 @@ def test_cancelling_mid_batch_removes_the_frames_already_written(normal_clip, bl
             cancel.set()
 
     result = run_batch(
-        Options(paths=[normal_clip, blurred_clip], out_dir=out_dir, per_clip=2, min_gap=1.0, jobs=1),
+        Options(paths=[normal_clip, blurred_clip], out_dir=out_dir, per_clip=2, min_gap=1.0,
+                jobs=1, select_mode=MODE_COUNT),
         on_message=on_message,
         cancel=cancel,
     )
@@ -181,3 +189,89 @@ def test_no_input_files_is_reported(tmp_path):
     result = run_batch(Options(paths=[], out_dir=str(tmp_path / "empty")))
     assert result.results == {}
     assert S.no_input_files() in result.messages
+
+
+# --------------------------------------------------------------------------
+# Threshold selection (the default mode)
+# --------------------------------------------------------------------------
+
+
+def test_threshold_mode_is_the_default():
+    options = Options()
+    assert options.select_mode == MODE_THRESHOLD
+    assert options.global_top > 0, "the batch page is on by default"
+    assert options.export_height == 0, "exports keep the source resolution by default"
+
+
+@requires_ffmpeg
+def test_threshold_mode_returns_a_count_that_follows_the_footage(normal_clip, tmp_path):
+    """No fixed target: a low bar returns frames, a high bar returns none."""
+    generous = _run([normal_clip], tmp_path / "low", min_score=0.0, min_gap=0.5,
+                    max_per_clip=0).results["clips"][0]
+    strict = _run([normal_clip], tmp_path / "high", min_score=0.99, min_gap=0.5).results["clips"][0]
+
+    assert generous["selection"]["mode"] == MODE_THRESHOLD
+    assert len(generous["frames"]) > len(strict["frames"])
+    assert strict["frames"] == []
+    assert generous["selection"]["requested"] is None, "threshold mode promises no count"
+    assert generous["selection"]["shortfall"] == 0
+
+
+@requires_ffmpeg
+def test_threshold_mode_says_so_when_nothing_passes(normal_clip, tmp_path):
+    """Zero frames is a result that has to be explained, not an empty folder."""
+    result = _run([normal_clip], tmp_path, min_score=0.99, min_gap=0.5)
+    clip = result.results["clips"][0]
+
+    assert clip["frames"] == []
+    assert clip["selection"]["passed_threshold"] == 0
+    assert clip["selection"]["best_score"] is not None
+    expected = S.threshold_none_passed(clip["selection"]["best_score"], 0.99)
+    assert expected in clip["notes"]
+    assert expected in result.messages
+
+    html = open(os.path.join(result.out_dir, report.REPORT_HTML), encoding="utf-8").read()
+    assert S.REPORT_NO_FRAMES in html
+
+
+@requires_ffmpeg
+def test_threshold_mode_is_bounded(normal_clip, tmp_path):
+    """A long clip cannot quietly export a hundred stills."""
+    clip = _run([normal_clip], tmp_path, min_score=0.0, min_gap=0.5, max_per_clip=2).results["clips"][0]
+    assert len(clip["frames"]) <= 2
+    if clip["selection"]["capped"]:
+        assert S.threshold_capped(len(clip["frames"])) in clip["notes"]
+
+
+@requires_ffmpeg
+def test_threshold_is_declared_uncalibrated(normal_clip, tmp_path):
+    result = _run([normal_clip], tmp_path, min_score=0.2, min_gap=0.5)
+    note = S.selection_mode_threshold(0.2)
+    assert note in result.results["clips"][0]["notes"]
+    assert note in result.messages
+
+
+@requires_ffmpeg
+def test_global_batch_page_is_produced_by_default(normal_clip, blurred_clip, tmp_path):
+    result = _run([normal_clip, blurred_clip], tmp_path, min_score=0.0, min_gap=1.0, jobs=1)
+    assert result.results["global_top"], "the batch page is on by default"
+    html = open(os.path.join(result.out_dir, report.REPORT_HTML), encoding="utf-8").read()
+    assert S.REPORT_GLOBAL in html
+    assert S.REPORT_GLOBAL_NOTE in html, "the cross-clip page must be labelled less reliable"
+
+
+@requires_ffmpeg
+def test_global_batch_page_can_be_turned_off(normal_clip, tmp_path):
+    result = _run([normal_clip], tmp_path, min_score=0.0, min_gap=1.0, global_top=0)
+    assert "global_top" not in result.results
+    html = open(os.path.join(result.out_dir, report.REPORT_HTML), encoding="utf-8").read()
+    assert S.REPORT_GLOBAL not in html
+
+
+@requires_ffmpeg
+def test_export_height_is_recorded_and_native_by_default(normal_clip, tmp_path):
+    native = _run([normal_clip], tmp_path / "native", min_score=0.0, min_gap=1.0, max_per_clip=1)
+    scaled = _run([normal_clip], tmp_path / "scaled", min_score=0.0, min_gap=1.0, max_per_clip=1,
+                  export_height=120)
+    assert S.export_resolution_native() in native.results["clips"][0]["notes"]
+    assert S.export_resolution_scaled(120) in scaled.results["clips"][0]["notes"]

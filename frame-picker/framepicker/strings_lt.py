@@ -56,6 +56,10 @@ def clip_done(name: str, chosen: int, requested: int, seconds: float) -> str:
     return f"Baigta: {name} — parinkta {chosen} iš prašytų {requested} kadrų, užtruko {seconds:.1f} s"
 
 
+def clip_done_threshold(name: str, chosen: int, seconds: float) -> str:
+    return f"Baigta: {name} — ribą peržengė ir buvo parinkta {chosen} kadrų, užtruko {seconds:.1f} s"
+
+
 def throughput(seconds_per_footage_minute: float) -> str:
     return f"Išmatuotas našumas: {seconds_per_footage_minute:.1f} s vienai medžiagos minutei šiame kompiuteryje"
 
@@ -66,6 +70,13 @@ def batch_summary(
     return (
         f"Santrauka: pateikta failų {files_given}, apdorota {files_done}, praleista {files_skipped}; "
         f"prašyta kadrų {frames_requested}, pateikta {frames_delivered}"
+    )
+
+
+def batch_summary_threshold(files_given: int, files_done: int, files_skipped: int, frames_delivered: int) -> str:
+    return (
+        f"Santrauka: pateikta failų {files_given}, apdorota {files_done}, praleista {files_skipped}; "
+        f"pateikta kadrų {frames_delivered} (kiekis priklauso nuo kokybės ribos, nebuvo prašoma fiksuoto skaičiaus)"
     )
 
 
@@ -245,6 +256,40 @@ def confidence_ok(spread: float, n: int) -> str:
 # --------------------------------------------------------------------------
 
 
+def selection_mode_threshold(threshold: float) -> str:
+    return (
+        f"Atranka pagal kokybės ribą: imami kadrai, kurių įvertis ≥ {threshold:.2f}. "
+        f"Riba yra pradinė, NEIŠMATUOTA reikšmė — ją reikia kalibruoti su savo medžiaga."
+    )
+
+
+def selection_mode_count(requested: int) -> str:
+    return f"Atranka pagal kiekį: prašoma {requested} kadrų iš įrašo"
+
+
+def threshold_passed(count: int, threshold: float) -> str:
+    return f"Ribą {threshold:.2f} peržengė kandidatų: {count}"
+
+
+def threshold_none_passed(best: float, threshold: float) -> str:
+    return (
+        f"Nė vienas kadras nepasiekė ribos {threshold:.2f} (geriausias įvertis {best:.3f}) — "
+        f"iš šio įrašo neišsaugota nieko. Sumažinkite ribą, jeigu norite matyti geriausius turimus kadrus."
+    )
+
+
+def threshold_capped(kept: int) -> str:
+    return f"Apribota iki {kept} kadrų (--max-per-clip); ribą peržengė daugiau kandidatų"
+
+
+def export_resolution_native() -> str:
+    return "Eksportuojama šaltinio raiška (be mažinimo)"
+
+
+def export_resolution_scaled(height: int) -> str:
+    return f"Eksportuojant mažinama iki {height}p (šaltinio raiška išsaugoma tik results.json)"
+
+
 def shortfall_header(delivered: int, requested: int) -> str:
     return f"Pateikta {delivered} kadrų vietoj prašytų {requested}. Priežastis:"
 
@@ -300,6 +345,9 @@ REPORT_WEIGHTS_NOTE = (
 )
 REPORT_COLOR_NOTE = "Spalvų apdorojimas"
 REPORT_MODE = "Režimas"
+REPORT_SELECTION = "Atranka"
+REPORT_THRESHOLD = "Kokybės riba"
+REPORT_EXPORT = "Eksportas"
 REPORT_GLOBAL = "Geriausi visos partijos kadrai"
 REPORT_GLOBAL_NOTE = (
     "Šis palyginimas tarp skirtingų įrašų remiasi neperskaičiuotomis reikšmėmis ir "

@@ -22,12 +22,23 @@ from typing import Callable, Sequence
 from . import decode, export, features, proc, report, scoring
 from . import strings_lt as S
 from .probe import ProbeError, probe
-from .select import Candidate, select
+from .select import (
+    DEFAULT_MAX_PER_CLIP,
+    DEFAULT_MIN_SCORE,
+    MODE_COUNT,
+    MODE_THRESHOLD,
+    Candidate,
+    select,
+)
 
 VERSION = "0.1.0"
 
 DEFAULT_OUT_DIR = "frame-picker-out"
 DEFAULT_PER_CLIP = 6
+#: Frames of the whole batch on the "best of the batch" page. On by default;
+#: the page is labelled less reliable than the per-clip ranking, because it
+#: compares raw values across different cameras and picture profiles.
+DEFAULT_GLOBAL_TOP = 20
 DEFAULT_FPS = 2.0
 DEFAULT_MIN_GAP = 2.0
 #: Upper bound on buffered analysis frames per clip. Above this the sampling
@@ -54,9 +65,13 @@ class Options:
     face_model: str | None = None
     image_format: str = "jpg"
     jpeg_quality: int = 2
-    global_top: int = 0
+    global_top: int = DEFAULT_GLOBAL_TOP
     max_candidates: int = DEFAULT_MAX_CANDIDATES
     hwaccel: str = "auto"
+    select_mode: str = MODE_THRESHOLD
+    min_score: float = DEFAULT_MIN_SCORE
+    max_per_clip: int = DEFAULT_MAX_PER_CLIP
+    export_height: int = 0
 
     def as_dict(self) -> dict:
         return {
@@ -73,6 +88,10 @@ class Options:
             "global_top": self.global_top,
             "max_candidates": self.max_candidates,
             "hwaccel": self.hwaccel,
+            "select_mode": self.select_mode,
+            "min_score": self.min_score,
+            "max_per_clip": self.max_per_clip,
+            "export_height": self.export_height,
         }
 
 
@@ -336,8 +355,19 @@ def analyse_clip(
     messenger.say(record["confidence"]["message"])
 
     # -- select ------------------------------------------------------------
-    selection = select(candidates, options.per_clip, min_gap=options.min_gap, clip_duration=clip.duration)
+    selection = select(
+        candidates,
+        options.per_clip,
+        mode=options.select_mode,
+        min_score=options.min_score,
+        max_per_clip=options.max_per_clip,
+        min_gap=options.min_gap,
+        clip_duration=clip.duration,
+    )
     record["selection"] = selection.as_dict()
+    for note in selection.notes:
+        messenger.say(note)
+    record["notes"].extend(selection.notes)
     if selection.shortfall:
         messenger.say(S.shortfall_header(len(selection.selected), options.per_clip))
         for reason in selection.reasons:
@@ -354,7 +384,12 @@ def analyse_clip(
             normalisation=normalisation,
             quality=options.jpeg_quality,
             image_format=options.image_format,
+            height=options.export_height,
             cancel=cancel,
+        )
+        record["notes"].append(
+            S.export_resolution_scaled(options.export_height) if options.export_height
+            else S.export_resolution_native()
         )
         for text in errors:
             messenger.say(text)
@@ -374,7 +409,10 @@ def analyse_clip(
             })
 
     record["elapsed_s"] = time.perf_counter() - started
-    messenger.say(S.clip_done(clip.name, len(record["frames"]), options.per_clip, record["elapsed_s"]))
+    if options.select_mode == MODE_THRESHOLD:
+        messenger.say(S.clip_done_threshold(clip.name, len(record["frames"]), record["elapsed_s"]))
+    else:
+        messenger.say(S.clip_done(clip.name, len(record["frames"]), options.per_clip, record["elapsed_s"]))
     return record
 
 
@@ -457,7 +495,12 @@ def run_batch(
             "files_given": len(paths),
             "files_processed": len(done),
             "files_skipped": len(skipped),
-            "frames_requested": len(done) * options.per_clip,
+            "select_mode": options.select_mode,
+            "min_score": options.min_score if options.select_mode == MODE_THRESHOLD else None,
+            # A fixed target only exists in count mode; in threshold mode the
+            # count is an outcome, not a promise, so there is nothing to fall
+            # short of and the field stays null instead of pretending.
+            "frames_requested": len(done) * options.per_clip if options.select_mode == MODE_COUNT else None,
             "frames_delivered": frames_delivered,
             "footage_seconds": footage_seconds,
             "wall_clock_seconds": elapsed,
@@ -480,8 +523,11 @@ def run_batch(
     html_path = report.write_report_html(results, options.out_dir)
     created.add(html_path)
 
-    messenger.say(S.batch_summary(
-        len(paths), len(done), len(skipped), len(done) * options.per_clip, frames_delivered))
+    if options.select_mode == MODE_THRESHOLD:
+        messenger.say(S.batch_summary_threshold(len(paths), len(done), len(skipped), frames_delivered))
+    else:
+        messenger.say(S.batch_summary(
+            len(paths), len(done), len(skipped), len(done) * options.per_clip, frames_delivered))
     if skipped:
         messenger.say(S.skipped_files_header())
         for item in skipped:
@@ -519,7 +565,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("videos", nargs="*", help="video files to analyse")
     parser.add_argument("--out", dest="out_dir", default=DEFAULT_OUT_DIR, help="output directory")
-    parser.add_argument("--per-clip", type=int, default=DEFAULT_PER_CLIP, help="frames to pick per clip")
+    parser.add_argument("--per-clip", type=int, default=DEFAULT_PER_CLIP,
+                        help="frames to pick per clip (count mode only)")
+    parser.add_argument("--select", dest="select_mode", choices=(MODE_THRESHOLD, MODE_COUNT),
+                        default=MODE_THRESHOLD,
+                        help="'threshold' keeps every frame above --min-score; "
+                             "'count' aims at --per-clip and reports any shortfall")
+    parser.add_argument("--min-score", type=float, default=DEFAULT_MIN_SCORE,
+                        help="score a frame must reach in threshold mode "
+                             "(starting value, not calibrated)")
+    parser.add_argument("--max-per-clip", type=int, default=DEFAULT_MAX_PER_CLIP,
+                        help="upper bound on frames per clip in threshold mode (0 = no bound)")
+    parser.add_argument("--export-height", type=int, default=0,
+                        help="scale exported stills down to this height "
+                             "(e.g. 1080); 0 keeps the source resolution")
     parser.add_argument("--fps", type=float, default=DEFAULT_FPS, help="analysis sampling rate")
     parser.add_argument("--min-gap", type=float, default=DEFAULT_MIN_GAP,
                         help="minimum seconds between two picked frames")
@@ -532,8 +591,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--format", dest="image_format", choices=("jpg", "png"), default="jpg",
                         help="exported image format")
     parser.add_argument("--jpeg-quality", type=int, default=2, help="ffmpeg -q:v for JPEG (2 = best)")
-    parser.add_argument("--global-top", type=int, default=0,
-                        help="also produce a 'best of the whole batch' section with N frames")
+    parser.add_argument("--global-top", type=int, default=DEFAULT_GLOBAL_TOP,
+                        help="frames on the 'best of the whole batch' section (0 turns it off)")
     parser.add_argument("--max-candidates", type=int, default=DEFAULT_MAX_CANDIDATES,
                         help="upper bound on analysis frames buffered per clip")
     parser.add_argument("--hwaccel", default="auto", help="hardware decoder to try ('auto', 'cuda', 'none')")
@@ -558,6 +617,10 @@ def options_from_args(args: argparse.Namespace) -> Options:
         global_top=args.global_top,
         max_candidates=args.max_candidates,
         hwaccel=args.hwaccel,
+        select_mode=args.select_mode,
+        min_score=args.min_score,
+        max_per_clip=args.max_per_clip,
+        export_height=args.export_height,
     )
 
 

@@ -91,7 +91,11 @@ python -m framepicker VIDEO... [--out DIR] [--per-clip 6] [--fps 2]
 | Flag | Default | Meaning |
 |---|---|---|
 | `--out` | `frame-picker-out` | output directory |
-| `--per-clip` | `6` | frames to pick per clip |
+| `--select` | `threshold` | `threshold` keeps every frame above `--min-score`; `count` aims at `--per-clip` |
+| `--min-score` | `0.65` | score a frame has to reach in threshold mode — **an uncalibrated starting value** |
+| `--max-per-clip` | `12` | upper bound per clip in threshold mode (`0` = no bound) |
+| `--per-clip` | `6` | target frames per clip, **count mode only** |
+| `--export-height` | `0` | scale exported stills down to this height (e.g. `1080`); `0` keeps the source resolution |
 | `--fps` | `2` | analysis sampling rate |
 | `--min-gap` | `2.0` | minimum seconds between two picked frames (or 3 % of the clip, whichever is larger) |
 | `--convert-log` | `auto` | `auto` uses metadata then filename hints; `on`/`off` force it |
@@ -101,7 +105,7 @@ python -m framepicker VIDEO... [--out DIR] [--per-clip 6] [--fps 2]
 | `--face-model` | – | explicit path to a YuNet `.onnx` |
 | `--format` | `jpg` | `jpg` or `png` |
 | `--jpeg-quality` | `2` | ffmpeg `-q:v` (2 = best) |
-| `--global-top N` | `0` | also produce a "best of the whole batch" section |
+| `--global-top` | `20` | frames on the "best of the whole batch" section (`0` turns it off) |
 | `--max-candidates` | `3000` | upper bound on analysis frames buffered per clip |
 | `--hwaccel` | `auto` | `auto` tries CUDA, `none` forces CPU |
 
@@ -129,8 +133,11 @@ evaluated, rejects broken down by cause, the confidence verdict, the selection
 result with any shortfall reason, wall-clock time, and every chosen frame with
 its timestamp, score, full feature values and reasons.
 
-Exported frames are cut from the **source file** at full resolution, never from
-the 640 px analysis proxy. If a LUT or a normalisation was used for analysis,
+Exported frames are cut from the **source file** at its own resolution, never
+from the 640 px analysis proxy: 4K comes out 4K, 2.7K comes out 2.7K.
+`--export-height 1080` scales the exported still down; it only ever scales
+**down**, so a 1080p source asked for 1080p is left untouched rather than
+upscaled. The source resolution stays in `results.json` either way. If a LUT or a normalisation was used for analysis,
 the same transform is applied to the exported image so that what you look at is
 what was scored; the untouched timestamp stays in `results.json` so a
 full-quality re-grab can be redone later.
@@ -177,7 +184,22 @@ in the same confident format as a real one.
 
 ### Selection
 
-Greedy from the top of the ranking, keeping a candidate only if it is
+Two modes. **Threshold is the default**: every frame scoring at least
+`--min-score` is taken, so a weak clip can return two frames and a strong one
+twelve. `--max-per-clip 12` bounds it so a long file cannot quietly export a
+hundred stills; `--max-per-clip 0` removes the bound.
+
+`--min-score 0.65` is **a starting value chosen by argument, not by
+measurement** — the same status as the weights, and it means little until the
+weights are calibrated. Every run prints the threshold with that warning
+attached. When no frame in a clip reaches it, the tool says so, names the best
+score it did see, and tells you to lower the bar; it does not quietly write an
+empty folder.
+
+`--select count` is the old behaviour: aim at `--per-clip`, and report any
+shortfall with a stated reason.
+
+Either mode then walks the ranking greedily, keeping a candidate only if it is
 
 1. at least `--min-gap` seconds (or 3 % of the clip) from every frame already
    kept, **and**
@@ -185,11 +207,15 @@ Greedy from the top of the ranking, keeping a candidate only if it is
    above a threshold, or colour histogram distance above a threshold. dHash is
    implemented directly in `features.py`; it does not justify a dependency.
 
-If the constraints cannot produce the requested count, fewer frames come back
-**with a stated reason** ("the clip is 5.0 s long and the minimum gap is 2.0 s —
-at most 3 fit", "the remaining candidates are near-identical"). Silently
-returning three frames when six were asked for is the failure mode this project
-keeps paying for.
+In count mode, if the constraints cannot produce the requested count, fewer
+frames come back **with a stated reason** ("the clip is 5.0 s long and the
+minimum gap is 2.0 s — at most 3 fit", "the remaining candidates are
+near-identical"). Silently returning three frames when six were asked for is the
+failure mode this project keeps paying for. In threshold mode there is no fixed
+target to fall short of, so `frames_requested` is `null` in `results.json`
+rather than a number the run never promised — but the counts that led to the
+result (candidates above the threshold, rejected as duplicates, rejected on the
+time gap, capped) are all still reported.
 
 ---
 
@@ -206,8 +232,8 @@ The only figure measured so far, for reference:
 | Clip | 1920×1080, H.264, 30 fps, 60 s (ffmpeg `testsrc2`) |
 | Machine | 4-core Intel Xeon @ 2.10 GHz container, no GPU |
 | Decode path | CPU (`-hwaccel cuda` failed: `Cannot load libcuda.so.1`) |
-| Settings | `--per-clip 6 --min-gap 2`, faces on, saliency on |
-| Result | **4.8 s per minute of footage** |
+| Settings | defaults (`--select threshold --min-score 0.65 --min-gap 2`), faces on, saliency on |
+| Result | **4.7 s per minute of footage** |
 
 This says nothing about the target RTX 2060 machine, about hardware decode, or
 about real camera footage. Synthetic `testsrc2` is not representative content —
@@ -297,18 +323,35 @@ is a reasonable v2), DaVinci Resolve (not required for anything).
 
 ---
 
-## Open questions
+## Decisions taken
 
-Not decided here. The current behaviour is whatever the task document specified,
-and each answer is a flag flip rather than a rewrite:
+The four open questions in the task document were put to Tomas and answered.
+What that changed:
 
-1. **Fixed count or quality threshold?** Right now `--per-clip 6` is a fixed
-   target and a shortfall is reported with a reason. A threshold mode that
-   returns 2 or 12 frames does not exist yet.
-2. **JPEG q2 or PNG?** Default is JPEG `-q:v 2`; `--format png` already works if
-   the frames go on for further grading.
-3. **A global "top 20 of the batch" page?** Implemented behind `--global-top N`,
-   off by default, and labelled less reliable than the per-clip ranking.
-4. **Are faces always better?** Currently yes — a face above 1 % of the frame
-   sets a high content floor for every clip. If that is true for event footage
-   but wrong for drone work, the fix is a per-run switch, not a new model.
+1. **Per-clip count: quality threshold.** `--select threshold` is now the
+   default: every frame above `--min-score` is taken, two from a weak clip and
+   twelve from a strong one, bounded by `--max-per-clip 12`. The old fixed
+   target is still there as `--select count`. The threshold itself is
+   uncalibrated and everything that prints it says so.
+2. **Export resolution: native.** Stills come out at the source resolution —
+   4K stays 4K, 2.7K stays 2.7K — and `--export-height 1080` is there when a
+   1080p copy is wanted. Format stays JPEG `-q:v 2` by default with
+   `--format png` available; if "native quality" should also mean lossless
+   rather than only full-resolution, that is a one-word change to the default.
+3. **Global batch page: on by default.** `--global-top 20` now, still labelled
+   in the report as less reliable than the per-clip ranking, because it
+   compares raw values across different cameras and picture profiles.
+   `--global-top 0` turns it off.
+4. **Faces: always better.** Unchanged — any face over 1 % of the frame sets a
+   high content floor for every clip, drone footage included.
+
+## Still open
+
+* The weights, the threshold, and the diversity thresholds are all uncalibrated
+  starting values. Calibrating them needs a batch of Tomas's own footage plus
+  his own picks to compare against; nothing here can substitute for that.
+* Whether `--min-score 0.65` is a sensible default is unknown. It was chosen
+  from the structure of the score, not from measurement: on the synthetic
+  `testsrc2` fixtures the best frame of a clip scores 0.64, so that clip
+  correctly returns nothing and says why. Real footage may want a different
+  number in either direction.

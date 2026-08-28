@@ -104,6 +104,24 @@ def _esc(value) -> str:
     return html.escape(str(value), quote=True)
 
 
+def _summary_line(summary: dict) -> str:
+    """In threshold mode there is no fixed target, so nothing to fall short of."""
+    if summary.get("frames_requested") is None:
+        return S.batch_summary_threshold(
+            summary.get("files_given", 0),
+            summary.get("files_processed", 0),
+            summary.get("files_skipped", 0),
+            summary.get("frames_delivered", 0),
+        )
+    return S.batch_summary(
+        summary.get("files_given", 0),
+        summary.get("files_processed", 0),
+        summary.get("files_skipped", 0),
+        summary.get("frames_requested", 0),
+        summary.get("frames_delivered", 0),
+    )
+
+
 def _short(text: str, limit: int = 120) -> str:
     """Keep a decoder error readable in a metadata row; results.json keeps it whole."""
     text = " ".join(str(text or "").split())
@@ -202,13 +220,7 @@ def write_report_html(results: dict, out_dir: str) -> str:
         f'<div class="sub">{S.REPORT_GENERATED}: {_esc(generated)}</div>',
         '<div class="card">',
         f"<h2>{S.REPORT_SUMMARY}</h2>",
-        _note(S.batch_summary(
-            summary.get("files_given", 0),
-            summary.get("files_processed", 0),
-            summary.get("files_skipped", 0),
-            summary.get("frames_requested", 0),
-            summary.get("frames_delivered", 0),
-        )),
+        _note(_summary_line(summary)),
     ]
     if summary.get("throughput_s_per_footage_minute"):
         head.append(_note(S.throughput(summary["throughput_s_per_footage_minute"])))

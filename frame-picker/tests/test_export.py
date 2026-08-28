@@ -78,3 +78,32 @@ def test_output_names_sort_by_rank():
 def test_output_name_sanitises_the_clip_name():
     name = export.output_name("a b/c:d*e.mov", 1, 1.0, 0.5)
     assert "/" not in name and ":" not in name and " " not in name
+
+
+@requires_ffmpeg
+def test_export_height_scales_down_and_never_up(counter_clip, tmp_path):
+    """4K stays 4K by default; --export-height only ever scales down."""
+    import cv2
+
+    from framepicker.probe import probe
+
+    source = probe(counter_clip)
+
+    native = str(tmp_path / "native.jpg")
+    smaller = str(tmp_path / "small.jpg")
+    bigger = str(tmp_path / "big.jpg")
+    assert export.export_frame(counter_clip, 1.0, native).ok
+    assert export.export_frame(counter_clip, 1.0, smaller, height=120).ok
+    assert export.export_frame(counter_clip, 1.0, bigger, height=source.height * 4).ok
+
+    assert cv2.imread(native).shape[0] == source.height
+    assert cv2.imread(smaller).shape[0] == 120
+    assert cv2.imread(bigger).shape[0] == source.height, "an upscale must never happen"
+
+
+def test_export_filter_is_empty_when_nothing_is_asked_for():
+    assert export.build_export_filter(None, 0) is None
+    assert "scale" in export.build_export_filter(None, 1080)
+    assert "lut3d" in export.build_export_filter("look.cube", 0)
+    chain = export.build_export_filter("look.cube", 1080)
+    assert chain.index("lut3d") < chain.index("scale"), "grade first, then resize"
