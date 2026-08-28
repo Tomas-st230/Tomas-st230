@@ -38,18 +38,41 @@ Read this before trusting any output.
 ## Install
 
 ```bash
-python -m pip install -e .            # CLI
-python -m pip install -e ".[gui]"     # + PySide6 for the drag-and-drop window
-python -m pip install -e ".[dev]"     # + pytest
+python -m venv .venv
+# Windows:  .venv\Scripts\activate
+# Linux/macOS:  source .venv/bin/activate
+
+python -m pip install -e ".[gui,dev]"     # CLI + drag-and-drop window + tests
+python -m pip install -e .                # CLI only
+python -m pytest -q                        # 62 tests, all should pass
 ```
 
 `ffmpeg` and `ffprobe` must be on `PATH`. Nothing else shells out: every
 external process in this project goes through `framepicker/proc.py`, and a test
 enforces that.
 
-`opencv-contrib-python` is optional. Without it the saliency-based composition
-term is dropped, the run continues, and the report says the term was dropped —
-it is never silently scored as zero.
+**About OpenCV.** The dependency is `opencv-contrib-python`, not plain
+`opencv-python`, because `cv2.saliency` — the composition term — exists only in
+contrib. The two packages share the `cv2` namespace and
+[upstream is explicit](https://github.com/opencv/opencv-python) that only **one**
+may be installed in an environment ("If you installed multiple different
+packages in the same environment, uninstall them all with `pip uninstall` and
+reinstall only one package"), so contrib cannot be offered as an optional extra
+that gets *added* to an existing `opencv-python` — that would break the
+environment instead of extending it.
+
+If you already have `opencv-python` (or the `-headless` variant) in the
+environment, uninstall it first:
+
+```bash
+python -m pip uninstall -y opencv-python opencv-python-headless
+python -m pip install opencv-contrib-python
+# on a server with no display, use opencv-contrib-python-headless instead
+```
+
+Running on plain `opencv-python` anyway is supported: the composition term is
+dropped, the run continues, and the report says the term was dropped — it is
+never silently scored as zero.
 
 ### Face detection model
 
@@ -310,7 +333,7 @@ On Windows every child process is started with `CREATE_NO_WINDOW` and a hidden
 | Dependency | Licence |
 |---|---|
 | `numpy` | BSD-3-Clause (bundled components: 0BSD, MIT, Zlib, CC0-1.0) |
-| `opencv-python` / `opencv-contrib-python` | Apache 2.0 |
+| `opencv-contrib-python` (or `opencv-python`) | Apache 2.0 |
 | `PySide6` (GUI only) | LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only |
 | `pytest` (dev only) | MIT |
 | YuNet ONNX model (`opencv/opencv_zoo`) | MIT, © 2020 Shiqi Yu |
