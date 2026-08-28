@@ -246,6 +246,18 @@ def format_report(report: dict) -> str:
     return "\n".join(lines)
 
 
+def analyse_paths(results_path: str, picks_target: str) -> dict:
+    """:func:`analyse`, straight from two paths.
+
+    Here rather than in the caller so that the window, the command line and
+    the tests all take the same route into this module - reading the files is
+    part of the job, not glue for whoever is calling.
+    """
+    with open(results_path, "r", encoding="utf-8") as handle:
+        results = json.load(handle)
+    return analyse(results, read_picks(picks_target))
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m framepicker.learn",

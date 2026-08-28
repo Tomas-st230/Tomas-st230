@@ -20,7 +20,8 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Callable, Sequence
 
-from . import decode, export, features, grading, keepawake, proc, report, scoring, sidecar
+from . import (decode, export, features, grading, keepawake, proc, report, runlog,
+               scoring, sidecar)
 from . import strings_lt as S
 from .probe import ProbeError, probe
 from .select import (
@@ -137,6 +138,7 @@ class Options:
     keyframes: bool = False
     gpu_scale: bool = True
     run_folder: bool = True
+    write_log: bool = True
 
     def as_dict(self) -> dict:
         return {
@@ -166,6 +168,7 @@ class Options:
             "keyframes": self.keyframes,
             "gpu_scale": self.gpu_scale,
             "run_folder": self.run_folder,
+            "write_log": self.write_log,
         }
 
 
@@ -203,6 +206,8 @@ class BatchResult:
     html_path: str | None = None
     cancelled: bool = False
     messages: list[str] = field(default_factory=list)
+    #: log.txt and log.jsonl, when the run wrote them.
+    log_paths: list[str] = field(default_factory=list)
 
 
 class _Created:
@@ -706,7 +711,8 @@ def expand_inputs(paths: Sequence[str], order: str = ORDER_DATE) -> tuple[list[s
     return unique, unmatched
 
 
-def clip_summary(index: int, path: str, record: dict | None, reason: str = "") -> dict:
+def clip_summary(index: int, path: str, record: dict | None, reason: str = "",
+                 values: dict | None = None) -> dict:
     """Flat, display-ready summary of one file. Built here so the GUI can
     render a table without knowing anything about the pipeline."""
     if record is None:
@@ -714,6 +720,7 @@ def clip_summary(index: int, path: str, record: dict | None, reason: str = "") -
             "index": index, "path": path, "name": os.path.basename(path), "ok": False,
             "is_log": None, "log_source": "", "color_mode": "", "decode_path": "",
             "look": "", "proxy": "", "frames": 0, "elapsed_s": 0.0, "reason": reason,
+            "values": {},
         }
     log = record.get("log", {})
     return {
@@ -730,6 +737,9 @@ def clip_summary(index: int, path: str, record: dict | None, reason: str = "") -
         "frames": len(record.get("frames", [])),
         "elapsed_s": float(record.get("elapsed_s") or 0.0),
         "reason": "",
+        # Everything measured about this file, flat, for a window that wants to
+        # show values without knowing what any of them mean.
+        "values": values if values is not None else runlog.clip_event(index, path, record),
     }
 
 
@@ -738,9 +748,21 @@ def run_batch(
     on_message: Callable[[str], None] | None = None,
     cancel: threading.Event | None = None,
     on_clip_done: Callable[[dict], None] | None = None,
+    _print_messages: bool = True,
 ) -> BatchResult:
     """Process every file in ``options.paths``. One bad file never aborts it."""
-    messenger = Messenger(on_message)
+    log = runlog.RunLog(enabled=options.write_log)
+
+    def sink(text: str) -> None:
+        # Everything said goes to the log file as well as to the caller, so
+        # the console, the window and log.txt can never disagree.
+        log.message(text)
+        if on_message is not None:
+            on_message(text)
+        elif _print_messages:
+            print(text, flush=True)
+
+    messenger = Messenger(sink)
     created = _Created()
     started = time.perf_counter()
 
@@ -769,6 +791,14 @@ def run_batch(
     os.makedirs(run_dir, exist_ok=True)
     if options.run_folder:
         messenger.say(S.run_folder_created(os.path.abspath(run_dir)))
+    log.open(run_dir)
+    for path in log.paths:
+        created.add(path)
+    if log.paths:
+        messenger.say(S.log_written(os.path.basename(log.paths[0]),
+                                    os.path.basename(log.paths[1])))
+    log.event("run_started", options=options.as_dict(), files=len(paths),
+              weights=dict(scoring.WEIGHTS), version=VERSION)
     clip_options = replace(options, out_dir=run_dir)
 
     clips: list[dict | None] = [None] * len(paths)
@@ -781,10 +811,15 @@ def run_batch(
         messenger.say(S.processing_file(index + 1, len(paths), os.path.basename(path)))
         try:
             clips[index] = analyse_clip(path, clip_options, messenger, created, cancel)
+            values = runlog.clip_event(index, path, clips[index])
+            log.event("clip", **values)
+            for frame in runlog.frame_events(values["file"], clips[index]):
+                log.event("frame", **frame)
             if on_clip_done is not None:
-                on_clip_done(clip_summary(index, path, clips[index]))
+                on_clip_done(clip_summary(index, path, clips[index], values=values))
         except ProbeError as exc:
             messenger.say(S.probe_failed(os.path.basename(path), str(exc)))
+            log.event("clip_failed", index=index, file=os.path.basename(path), reason=str(exc))
             with lock:
                 skipped.append({"path": path, "reason": str(exc)})
             if on_clip_done is not None:
@@ -792,6 +827,7 @@ def run_batch(
         except Exception as exc:  # noqa: BLE001 - one bad file must not kill the batch
             detail = f"{type(exc).__name__}: {exc}"
             messenger.say(S.probe_failed(os.path.basename(path), detail))
+            log.event("clip_failed", index=index, file=os.path.basename(path), reason=detail)
             with lock:
                 skipped.append({"path": path, "reason": detail})
             if on_clip_done is not None:
@@ -846,6 +882,8 @@ def run_batch(
         results["global_top"] = _global_top(done, options.global_top)
 
     if cancel is not None and cancel.is_set():
+        log.event("cancelled", files_done=len(done))
+        log.close()
         created.remove_all()
         # The run's own folder goes too, when this run is what created it and
         # nothing else ended up in it. Cancelling has to leave no trace, so
@@ -876,6 +914,13 @@ def run_batch(
         os.path.isfile(html_path) and os.path.getsize(html_path) > 0,
     )
     messenger.say(results["integrity"]["report_files"])
+    # The side-file sizes were measured before results.json existed, so they
+    # are taken again now that everything is on disk.
+    results["integrity"]["side_files"] = {
+        name: (os.path.getsize(os.path.join(run_dir, name))
+               if os.path.isfile(os.path.join(run_dir, name)) else None)
+        for name in report.SIDE_FILES
+    }
     # And the page's own links, read back off disk rather than assumed.
     links = report.check_report_links(html_path, run_dir)
     results["integrity"]["links"] = links
@@ -900,8 +945,13 @@ def run_batch(
     if footage_seconds > 0:
         messenger.say(S.throughput(elapsed / (footage_seconds / 60.0)))
     messenger.say(S.output_written(os.path.abspath(run_dir)))
+    log.event("run_finished", summary=results["summary"], integrity=results["integrity"])
+    log.close()
+    if log.errors:
+        messenger.say(S.log_write_failed(log.errors[0]))
 
-    return BatchResult(results, run_dir, json_path, html_path, messages=messenger.log)
+    return BatchResult(results, run_dir, json_path, html_path, messages=messenger.log,
+                       log_paths=list(log.paths))
 
 
 def _global_top(clips: Sequence[dict], count: int) -> list[dict]:

@@ -532,8 +532,8 @@ GUI_DONE = "Baigta"
 GUI_CANCELLED = "Atšaukta"
 
 GUI_COL_FILE = "Failas"
-GUI_COL_PROFILE = "Profilis"
-GUI_COL_COLOR = "Spalvos"
+GUI_COL_PROFILE = "Medžiaga"
+GUI_COL_COLOR = "Konvertavimas"
 GUI_COL_DECODE = "Dekodavimas"
 GUI_COL_FRAMES = "Kadrai"
 GUI_COL_STATUS = "Būsena"
@@ -656,7 +656,7 @@ GUI_LOOK_AUTO_HINT = (
     "pilkos plokštumos, vertikalios linijos) ir parenka „gamta“ arba „miestas“. "
     "Kai požymiai per artimi, profilis netaikomas."
 )
-GUI_COL_LOOK = "Profilis"
+GUI_COL_LOOK = "Spalvų profilis"
 GUI_STOPPING = "Stabdoma…"
 GUI_RESET = "Pradėti iš naujo"
 GUI_BUSY = "Vykdoma — naujų failų kelti negalima"
@@ -751,3 +751,130 @@ def learn_not_applied() -> str:
 
 def learn_cannot_read(path: str, detail: str) -> str:
     return f"Nepavyko perskaityti {path}: {detail}"
+
+
+# --------------------------------------------------------------------------
+# Paleidimo žurnalas (log.txt / log.jsonl)
+# --------------------------------------------------------------------------
+
+
+def log_written(text_name: str, data_name: str) -> str:
+    return (
+        f"Žurnalas rašomas į {text_name} (eilutės su laiku) ir {data_name} "
+        "(išmatuotos reikšmės, po vieną JSON įrašą eilutėje)."
+    )
+
+
+def log_write_failed(detail: str) -> str:
+    return f"Žurnalo įrašyti nepavyko: {detail}. Darbas dėl to nebuvo nutrauktas."
+
+
+REPORT_FILES = "Šio paleidimo failai"
+REPORT_FILES_NOTE = (
+    "Nuorodos veikia, kai ataskaita atidaroma iš to paties aplanko — visi failai guli šalia jos."
+)
+FILE_PURPOSE = {
+    "results.json": "visi duomenys mašinai skaityti",
+    "log.txt": "eiga su laiko žymomis",
+    "log.jsonl": "išmatuotos reikšmės: po vieną įrašą kiekvienam failui ir kadrui",
+}
+
+
+# --------------------------------------------------------------------------
+# Lango sąsaja: skirtukai, jungtukai, reikšmių pavadinimai
+# --------------------------------------------------------------------------
+
+GUI_TAB_MAIN = "Pagrindiniai"
+GUI_TAB_SPEED = "Greitis"
+GUI_TAB_EXPORT = "Eksportas ir atranka"
+GUI_TAB_PROGRESS = "Eiga"
+GUI_TAB_VALUES = "Reikšmės"
+
+GUI_PROXY = "Naudoti gretimą .LRF peržiūrą analizei"
+GUI_PROXY_HINT = (
+    "DJI prie kiekvieno įrašo įrašo 720p peržiūrą. Analizė vis tiek vyksta 640 px, "
+    "todėl skaitoma peržiūra, o kadrai eksportuojami iš originalo. Išmatuota: "
+    "peržiūra 0.061 s vienai medžiagos sekundei, originalas 0.418 s."
+)
+GUI_KEYFRAMES = "Dekoduoti tik atskaitos kadrus (greičiau)"
+GUI_KEYFRAMES_HINT = (
+    "Išmatuota: 5,4 karto greičiau 4K medžiagoje. Kadrų tinklelį tada nustato kamera "
+    "(DJI rašo atskaitos kadrą maždaug kas pusę sekundės), o ne „kadrų per sekundę“ laukas."
+)
+GUI_GPU_SCALE = "Mažinti kadrus GPU, kai įmanoma"
+GUI_HWACCEL = "Aparatinis dekodavimas"
+GUI_HWACCEL_AUTO = "automatiškai (bandyti CUDA)"
+GUI_HWACCEL_CUDA = "CUDA"
+GUI_HWACCEL_NONE = "tik procesorius"
+GUI_JOBS = "Failų vienu metu (0 = automatiškai)"
+GUI_FPS = "Kadrų analizei per sekundę"
+GUI_MAX_CANDIDATES = "Daugiausia analizuojamų kadrų viename faile"
+GUI_MIN_GAP = "Mažiausias tarpas tarp kadrų (s)"
+GUI_SELECT_MODE = "Atrankos būdas"
+GUI_SELECT_THRESHOLD = "pagal kokybės ribą"
+GUI_SELECT_COUNT = "fiksuotas kiekis iš failo"
+GUI_PER_CLIP = "Kadrų iš failo (fiksuoto kiekio režimu)"
+GUI_EXPORT_HEIGHT = "Eksporto aukštis (0 = originalus)"
+GUI_FORMAT = "Vaizdo formatas"
+GUI_JPEG_QUALITY = "JPEG kokybė (2 = geriausia)"
+GUI_GLOBAL_TOP = "„Geriausi visos partijos“ kadrų skaičius (0 = išjungta)"
+GUI_ORDER = "Failų tvarka"
+GUI_ORDER_DATE = "seniausi pirma (pagal failo datą)"
+GUI_ORDER_NAME = "pagal pavadinimą"
+GUI_ORDER_NONE = "kaip pateikta"
+GUI_NORMALISE = "Normalizavimo stiprumas (kai LUT nėra)"
+GUI_RUN_FOLDER = "Kiekvienam paleidimui — atskiras aplankas"
+GUI_WRITE_LOG = "Rašyti žurnalą (log.txt ir log.jsonl)"
+GUI_NO_FACES = "Neieškoti veidų"
+GUI_OPEN_LOG = "Atverti žurnalą"
+GUI_CALIBRATE = "Kalibruoti pagal mano kadrus…"
+GUI_CALIBRATE_PICK = "Aplankas su kadrais, kuriuos atrinkote"
+GUI_CALIBRATE_NEEDS_RUN = "Kalibravimui reikia bent vieno baigto paleidimo šioje sesijoje."
+GUI_VALUES_HINT = "Pasirinkite failą lentelėje, kad matytumėte visas jo išmatuotas reikšmes."
+GUI_VALUES_COL_NAME = "Reikšmė"
+GUI_VALUES_COL_VALUE = "Kiek"
+GUI_LOG_LINES = "Eiga rodoma čia; visos eilutės rašomos ir į log.txt paleidimo aplanke."
+
+#: Reikšmių pavadinimai lange (log.jsonl laukas -> ką rodyti).
+VALUE_LABELS = {
+    "file": "Failas",
+    "duration_s": "Trukmė, s",
+    "resolution": "Raiška",
+    "fps": "Kadrų per sekundę",
+    "codec": "Kodekas",
+    "pix_fmt": "Pikselių formatas",
+    "encoder_tag": "Kamera (encoder žyma)",
+    "is_log": "Plokščias (log) profilis",
+    "log_source": "Kuo tai nustatyta",
+    "log_profile": "Profilis",
+    "color_md": "color_md iš .SRT",
+    "log_is_a_guess": "Ar tai spėjimas",
+    "luma_span": "Šviesumo diapazonas",
+    "saturation": "Sodrumas",
+    "color_mode": "Spalvų veiksmas",
+    "lut": "LUT",
+    "proxy_file": "Peržiūros failas",
+    "proxy_used": "Peržiūra naudota",
+    "decode_path": "Dekodavimas",
+    "gpu_scaler": "GPU mažinimas",
+    "keyframes_only": "Tik atskaitos kadrai",
+    "frames_sampled": "Paimta kadrų",
+    "effective_fps": "Faktinis kadrų tankis",
+    "candidates": "Įvertinta kandidatų",
+    "rejected": "Atmesta iš karto",
+    "rejected_dark": "…per tamsūs",
+    "rejected_bright": "…perdegę",
+    "rejected_blurry": "…neryškūs",
+    "confidence_spread": "Įverčių išsiskyrimas",
+    "confidence_informative": "Reitingas informatyvus",
+    "look_requested": "Prašytas profilis",
+    "look_applied": "Pritaikytas profilis",
+    "look_nature_score": "Gamtos įvertis",
+    "look_city_score": "Miesto įvertis",
+    "look_decided": "Ar nuspręsta",
+    "best_score": "Geriausias įvertis",
+    "frames_delivered": "Pateikta kadrų",
+    "elapsed_s": "Užtruko, s",
+}
+GUI_YES = "taip"
+GUI_NO = "ne"

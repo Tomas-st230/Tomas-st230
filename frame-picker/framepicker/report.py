@@ -16,10 +16,15 @@ import os
 import re
 from typing import Iterable
 
+from . import runlog
 from . import strings_lt as S
 
 RESULTS_JSON = "results.json"
 REPORT_HTML = "report.html"
+#: Files a run writes that are not exported frames. They are linked from the
+#: page and checked like everything else, instead of being reported as
+#: leftovers nothing refers to.
+SIDE_FILES = (RESULTS_JSON, runlog.LOG_TXT, runlog.LOG_JSONL)
 
 #: Long edge of the preview images embedded in the HTML. The exported files
 #: are the deliverable; these are only there to look at.
@@ -140,7 +145,7 @@ def verify(results: dict, out_dir: str, previews: dict[str, str]) -> dict:
         }
     except OSError:
         on_disk = set()
-    orphans = sorted(on_disk - set(referenced) - {RESULTS_JSON, REPORT_HTML})
+    orphans = sorted(on_disk - set(referenced) - set(SIDE_FILES) - {REPORT_HTML})
 
     messages: list[str] = []
     if missing:
@@ -156,8 +161,14 @@ def verify(results: dict, out_dir: str, previews: dict[str, str]) -> dict:
     if not messages:
         messages.append(S.integrity_ok(len(referenced), len(referenced), len(previews)))
 
+    side = {}
+    for name in SIDE_FILES:
+        path = os.path.join(out_dir, name)
+        side[name] = os.path.getsize(path) if os.path.isfile(path) else None
+
     return {
         "ok": not (missing or empty or failed_exports or no_preview),
+        "side_files": side,
         "frames_referenced": len(referenced),
         "files_present": len(referenced) - len(missing),
         "files_missing": missing,
@@ -379,6 +390,21 @@ def write_report_html(results: dict, out_dir: str, previews: dict[str, str] | No
         head.append(_note(S.integrity_header()))
         for text in integrity.get("messages", []):
             head.append(_note(text, "" if integrity.get("ok") else "bad"))
+    links = [
+        (name, os.path.getsize(os.path.join(out_dir, name)))
+        for name in SIDE_FILES
+        if os.path.isfile(os.path.join(out_dir, name))
+    ]
+    if links:
+        head.append(f"<h2>{S.REPORT_FILES}</h2>")
+        head.append(_note(S.REPORT_FILES_NOTE))
+        rows = "".join(
+            f'<tr><td><a href="{_esc(name)}"><code>{_esc(name)}</code></a></td>'
+            f"<td>{size / 1024:.0f} KB</td><td>{_esc(S.FILE_PURPOSE.get(name, ''))}</td></tr>"
+            for name, size in links
+        )
+        head.append(f"<table>{rows}</table>")
+
     weights = results.get("weights", {})
     weight_rows = "".join(f"<tr><td>{_esc(k)}</td><td>{v}</td></tr>" for k, v in weights.items())
     head.append(f"<h2>{S.REPORT_WEIGHTS}</h2><table>{weight_rows}</table>")

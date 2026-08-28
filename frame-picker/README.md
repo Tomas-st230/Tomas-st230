@@ -56,12 +56,46 @@ python -m venv .venv
 
 python -m pip install -e ".[gui,dev]"     # CLI + drag-and-drop window + tests
 python -m pip install -e .                # CLI only
-python -m pytest -q                        # 62 tests, all should pass
+python -m pytest -q                        # 178 tests, all should pass
 ```
 
 `ffmpeg` and `ffprobe` must be on `PATH`. Nothing else shells out: every
 external process in this project goes through `framepicker/proc.py`, and a test
 enforces that.
+
+### Updating an existing copy
+
+In PowerShell, from the folder you cloned into (`C:\Users\tomas\Tomas-st230`):
+
+```powershell
+cd C:\Users\tomas\Tomas-st230
+git fetch origin
+git checkout claude/best-frame-picker-tool-e25ekc
+git pull origin claude/best-frame-picker-tool-e25ekc
+
+cd frame-picker
+..\.venv\Scripts\Activate.ps1          # wherever your venv is
+python -m pip install -e ".[gui,dev]"    # only needed if dependencies changed
+python -m pytest -q                       # 178 tests; if any fail, stop and send the output
+python -m gui.drop_window
+```
+
+Three things worth knowing while updating:
+
+* **Nothing in your output folders is touched by an update.** Each run has
+  always written into its own `run-<date>-<time>` folder since this version, so
+  old runs stay exactly as they were.
+* **If `git pull` refuses because of local changes**, `git stash` them first (or
+  `git checkout -- .` to throw them away), then pull.
+* **If `pytest` cannot find `framepicker`**, you are in the wrong folder or the
+  wrong venv: the tests run from `frame-picker/`, with that venv active. Check
+  with `python -c "import framepicker, sys; print(sys.executable)"`.
+
+To see what changed since your copy:
+
+```powershell
+git log --oneline HEAD..origin/claude/best-frame-picker-tool-e25ekc
+```
 
 **About OpenCV.** The dependency is `opencv-contrib-python`, not plain
 `opencv-python`, because `cv2.saliency` — the composition term — exists only in
@@ -197,21 +231,52 @@ GUI — a wrapper around the same functions. There is no second code path, and
 python -m gui.drop_window
 ```
 
+**Everything the command line can do is in the window.** `OPTION_CONTROLS` in
+`gui/drop_window.py` maps every field of `Options` to the widget that sets it,
+and a test fails if an option is added to the pipeline without one — the two
+cannot drift apart. Two fields are deliberately not controls, and say so there:
+the input paths (they come from the drop area) and `--face-model` (a switch for
+debugging a model file).
+
 One window:
 
 * a drop area (files or whole folders; double-click opens a file dialog). A
   dropped folder is expanded immediately, so the table shows one row per file
   in the order they will be processed
-* a settings block — the drone LUT with a file picker and the "apply to every
-  file" override, the log-detection mode, the quality threshold, the per-clip
-  bound, and the output folder
+* settings on three tabs:
+  * **Pagrindiniai** — the drone LUT with a file picker and the "apply to every
+    file" override, the log-detection mode, the look and its strength, the
+    quality threshold, the per-clip bound, the output folder, and the two
+    switches for the per-run folder and the log
+  * **Greitis** — the `.LRF` proxy, keyframe-only decoding, GPU scaling, the
+    hardware decoder, files in parallel, the analysis frame rate, the candidate
+    cap, and faces off. Each of the three speed switches carries its measured
+    cost next to it, not an adjective.
+  * **Eksportas ir atranka** — selection mode and per-clip count, minimum gap,
+    export height, image format and JPEG quality, the "best of the batch"
+    count, file order, and the no-LUT normalisation strength
 * a table with one row per file: **profile** (log / normal), **colour** (LUT /
   normalised / untouched), **look** (which one was actually applied — the answer
   `auto` resolved to), **decode path** (GPU / CPU), frames picked, status.
   A skipped file says so and carries the reason as a tooltip — it never goes
   blank.
-* a progress bar, the current status line, cancel, "open results folder" and
-  "open report"
+* a bottom panel with two tabs:
+  * **Eiga** — every line the pipeline said, as it says it. The same lines go
+    to `log.txt`; the view keeps the last 5000 so a 163-file run cannot fill
+    memory.
+  * **Reikšmės** — click any file in the table and see everything measured
+    about it: the profile verdict and what decided it, `color_md`, the measured
+    luma span and saturation, which conversion was applied, the proxy, the
+    decode path and whether the GPU scaler was used, frames sampled,
+    candidates, what was rejected and why, the confidence spread, the
+    nature/city scores and the look actually applied, the best score, and the
+    elapsed time. These are the same fields `log.jsonl` carries — one dict,
+    built in `framepicker/runlog.py`, so the window, the console and the log
+    file cannot disagree.
+* a progress bar, the current status line, cancel, "open results folder",
+  "open report", **"open log"**, and **"calibrate against my frames"** (asks for
+  the folder of frames you kept and prints the analysis from
+  `framepicker.learn` into the progress view)
 
 The look box includes **`automatiškai (pagal sceną)`**, and the file dialogs
 open in `D:\tomas\Videos\DJI Drone foot` when that folder exists.
@@ -261,6 +326,44 @@ are all listed by name. The verdict prints to the console, appears at the top of
 `report.html`, and lands in `results.json` under `integrity`. A frame whose
 preview could not be produced renders a stated finding rather than a blank gap —
 which is what the first large run did, silently.
+
+### The run log
+
+Every run writes two more files into its own folder:
+
+| File | What it is |
+|---|---|
+| `log.txt` | every console line, with a timestamp. This is the file to send when something looks wrong |
+| `log.jsonl` | one JSON object per line — the **values** behind those lines |
+
+`log.jsonl` records `run_started` (the full options and weights), one `clip`
+record per file, one `frame` record per exported still, `clip_failed` for
+anything skipped, and `run_finished` (the summary and the integrity verdict).
+The numbers stay numbers, so the log can be queried rather than only read:
+
+```powershell
+# which files were treated as D-Log, and on what evidence?
+Get-Content log.jsonl | ConvertFrom-Json |
+  Where-Object { $_.event -eq 'clip' } |
+  Select-Object file, is_log, log_source, color_md, color_mode
+```
+
+```python
+# what did the look decide, and how close was it?
+import json
+for line in open("log.jsonl", encoding="utf-8"):
+    r = json.loads(line)
+    if r["event"] == "clip":
+        print(r["file"], r["look_applied"], r["look_nature_score"], r["look_city_score"])
+```
+
+Both files are linked from `report.html` (under "Šio paleidimo failai"),
+counted by the end-of-run check instead of being reported as leftovers, and
+deleted with everything else if the run is cancelled. `--no-log` is not a flag;
+the switch is in the window, or `write_log=False` on `Options`.
+
+A log must never be able to stop a run: if the files cannot be written, the run
+continues and says so at the end.
 
 ### While it runs
 
@@ -765,6 +868,22 @@ Enforced rules, each one a defect that already cost time:
 * `test_headless` — `import framepicker` with Qt blocked and no `DISPLAY`.
 * `test_no_hardcoded_lt_strings`.
 * `test_unreadable_file_does_not_abort_batch`.
+* `test_every_option_has_a_control_or_a_stated_reason` — every field of
+  `Options` is reachable from the window, or listed as deliberately not a
+  control. The command line and the window cannot drift apart.
+* `test_a_run_writes_both_logs_and_the_report_links_to_them` — the log files
+  exist, carry `run_started`/`clip`/`frame`/`run_finished` records with real
+  numbers, are linked from the page, and are not reported as leftovers.
+* `test_a_log_that_cannot_be_written_does_not_raise` — a log failure is
+  recorded, never fatal.
+* `test_closing_the_window_is_never_blocked`.
+* `test_cancelling_stops_and_leaves_the_window_ready_for_new_files`.
+* `test_symmetry_is_measured_against_the_frames_own_contrast` and
+  `test_repetition_finds_stripes_and_ignores_gradients` — the two new graphic
+  measurements cannot be fooled by a flat frame or a sky gradient.
+* `test_a_handful_of_picks_proposes_nothing` and
+  `test_no_weight_is_ever_deleted_or_allowed_to_take_over` — calibration
+  refuses to be confident.
 
 On Windows every child process is started with `CREATE_NO_WINDOW` and a hidden
 `STARTUPINFO`, so no console flashes behind the GUI.

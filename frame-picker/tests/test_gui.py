@@ -217,3 +217,147 @@ def test_the_open_folder_button_points_at_the_run_folder(window, tmp_path):
     window._on_finished(True, "", run_dir)
     assert window._run_dir == run_dir
     assert window._open_folder.isEnabled() is True
+
+
+# --------------------------------------------------------------------------
+# Everything the pipeline can do has to be reachable from the window
+# --------------------------------------------------------------------------
+
+
+def test_every_option_has_a_control_or_a_stated_reason(window):
+    """A new option must not quietly exist only on the command line."""
+    import dataclasses
+
+    from framepicker.cli import Options
+    from gui.drop_window import OPTION_CONTROLS
+
+    fields = {f.name for f in dataclasses.fields(Options)}
+    assert fields == set(OPTION_CONTROLS), (
+        fields - set(OPTION_CONTROLS), set(OPTION_CONTROLS) - fields)
+    for name, attribute in OPTION_CONTROLS.items():
+        if attribute is None:
+            continue
+        assert hasattr(window, attribute), f"{name} -> {attribute} is missing"
+
+
+def test_the_settings_reach_the_options_object(window, tmp_path):
+    from framepicker.cli import PROXY_OFF
+    from framepicker.select import MODE_COUNT
+
+    window._fps.setValue(4.0)
+    window._min_gap.setValue(3.5)
+    window._per_clip.setValue(9)
+    window._select_mode.setCurrentIndex(1)          # fixed count
+    window._export_height.setValue(1080)
+    window._format.setCurrentIndex(1)               # png
+    window._jpeg_quality.setValue(5)
+    window._global_top.setValue(7)
+    window._max_candidates.setValue(500)
+    window._hwaccel.setCurrentIndex(2)              # CPU only
+    window._jobs.setValue(3)
+    window._order_box.setCurrentIndex(1)            # by name
+    window._normalise.setValue(0.4)
+    window._proxy.setChecked(False)
+    window._keyframes.setChecked(True)
+    window._gpu_scale.setChecked(False)
+    window._run_folder.setChecked(False)
+    window._write_log.setChecked(False)
+    window._no_faces.setChecked(True)
+
+    options = window.options()
+    assert (options.fps, options.min_gap, options.per_clip) == (4.0, 3.5, 9)
+    assert options.select_mode == MODE_COUNT
+    assert (options.export_height, options.image_format, options.jpeg_quality) == (1080, "png", 5)
+    assert (options.global_top, options.max_candidates) == (7, 500)
+    assert (options.hwaccel, options.jobs, options.order) == ("none", 3, "name")
+    assert options.normalise_strength == pytest.approx(0.4)
+    assert options.proxy == PROXY_OFF
+    assert options.keyframes is True
+    assert options.gpu_scale is False
+    assert options.run_folder is False
+    assert options.write_log is False
+    assert options.no_faces is True
+
+
+# --------------------------------------------------------------------------
+# Following the run: the log, and the values behind it
+# --------------------------------------------------------------------------
+
+
+def test_every_message_lands_in_the_log_view(window):
+    window._on_message("pirma eilute")
+    window._on_message("antra eilute")
+    text = window._log_view.toPlainText()
+    assert "pirma eilute" in text and "antra eilute" in text
+    assert window._status.text() == "antra eilute"
+
+
+def test_the_values_of_a_file_are_shown_with_their_own_names(window, tmp_path):
+    from framepicker import strings_lt as S
+
+    (tmp_path / "a.mp4").write_bytes(b"x")
+    window._set_paths([str(tmp_path / "a.mp4")])
+    window._on_clip_done({
+        "index": 0, "ok": True, "is_log": True, "color_mode": "lut", "look": "nature",
+        "decode_path": "hw", "frames": 3,
+        "values": {"file": "a.mp4", "is_log": True, "look_nature_score": 0.7085,
+                    "confidence_spread": 0.108, "proxy_used": None,
+                    "not_a_known_key": "hidden"},
+    })
+    window._table.setCurrentCell(0, 0)
+    shown = {
+        window._values_table.item(r, 0).text(): window._values_table.item(r, 1).text()
+        for r in range(window._values_table.rowCount())
+    }
+    assert shown[S.VALUE_LABELS["look_nature_score"]] == "0.709"
+    assert shown[S.VALUE_LABELS["is_log"]] == S.GUI_YES
+    assert shown[S.VALUE_LABELS["proxy_used"]] == S.GUI_UNKNOWN
+    assert "not_a_known_key" not in shown and "hidden" not in shown.values()
+
+
+def test_the_log_view_is_bounded(window):
+    from gui.drop_window import LOG_MAX_LINES
+
+    for i in range(LOG_MAX_LINES + 200):
+        window._on_message(f"line {i}")
+    assert window._log_view.blockCount() <= LOG_MAX_LINES + 1
+
+
+def test_the_result_buttons_light_up_only_when_there_is_something_to_open(window, tmp_path):
+    run_dir = tmp_path / "results" / "run-20260828-120000"
+    run_dir.mkdir(parents=True)
+    log_path = run_dir / "log.txt"
+    log_path.write_text("x", encoding="utf-8")
+
+    window._on_finished(True, "", str(run_dir), str(log_path))
+    assert window._open_log.isEnabled() is True
+    assert window._open_folder.isEnabled() is True
+    assert window._open_report.isEnabled() is False, "no report file, no button"
+    assert window._calibrate.isEnabled() is True
+
+
+def test_calibration_runs_through_framepicker_and_prints_into_the_log(window, tmp_path, monkeypatch):
+    import json
+
+    from framepicker import strings_lt as S
+
+    run_dir = tmp_path / "run-1"
+    run_dir.mkdir()
+    (run_dir / "results.json").write_text(json.dumps({"clips": [{
+        "probe": {"name": "c.mp4"},
+        "frames": [{"file": "f_001.jpg", "score": 0.6,
+                     "features": {"components": {"content": 0.5, "technical": 0.8}}}],
+    }]}), encoding="utf-8")
+    keepers = tmp_path / "keepers"
+    keepers.mkdir()
+    (keepers / "f_001.jpg").write_bytes(b"x")
+
+    from PySide6.QtWidgets import QFileDialog
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory",
+                        staticmethod(lambda *a, **k: str(keepers)))
+    window._run_dir = str(run_dir)
+    window._on_calibrate()
+
+    text = window._log_view.toPlainText()
+    assert S.LEARN_TITLE in text
+    assert S.learn_not_enough(1, 0, 20, 20) in text, "one pick must not produce weights"

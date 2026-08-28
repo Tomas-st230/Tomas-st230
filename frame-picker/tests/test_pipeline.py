@@ -649,3 +649,74 @@ def test_auto_look_decides_per_clip_and_records_the_evidence(normal_clip, tmp_pa
     assert look["auto"] is not None
     assert look["auto"]["frames_measured"] > 0
     assert set(look["auto"]["evidence"]) >= {"vegetation", "sky", "warm", "grey", "vertical_share"}
+
+
+# --------------------------------------------------------------------------
+# The run's own log
+# --------------------------------------------------------------------------
+
+
+@requires_ffmpeg
+def test_a_run_writes_both_logs_and_the_report_links_to_them(normal_clip, tmp_path):
+    from framepicker import runlog
+
+    result = _run([normal_clip], tmp_path, per_clip=2, min_gap=1.0, select_mode=MODE_COUNT)
+    txt = os.path.join(result.out_dir, runlog.LOG_TXT)
+    jsonl = os.path.join(result.out_dir, runlog.LOG_JSONL)
+    assert result.log_paths == [txt, jsonl]
+    assert os.path.getsize(txt) > 0 and os.path.getsize(jsonl) > 0
+
+    events = [json.loads(line) for line in open(jsonl, encoding="utf-8") if line.strip()]
+    kinds = [event["event"] for event in events]
+    assert kinds[0] == "run_started" and kinds[-1] == "run_finished"
+    clip_events = [e for e in events if e["event"] == "clip"]
+    frame_events = [e for e in events if e["event"] == "frame"]
+    assert len(clip_events) == 1
+    assert clip_events[0]["candidates"] > 0
+    assert frame_events and frame_events[0]["components"]
+
+    # The page links to them, and nothing calls them leftovers.
+    html = open(os.path.join(result.out_dir, report.REPORT_HTML), encoding="utf-8").read()
+    assert f'href="{runlog.LOG_TXT}"' in html and f'href="{runlog.LOG_JSONL}"' in html
+    integrity = result.results["integrity"]
+    assert integrity["unreferenced_files"] == []
+    assert integrity["side_files"][runlog.LOG_JSONL] > 0
+    assert integrity["links"]["broken"] == 0
+
+
+@requires_ffmpeg
+def test_logging_can_be_turned_off_for_a_run(normal_clip, tmp_path):
+    from framepicker import runlog
+
+    result = _run([normal_clip], tmp_path, per_clip=1, min_gap=1.0, select_mode=MODE_COUNT,
+                  write_log=False)
+    assert result.log_paths == []
+    assert not os.path.isfile(os.path.join(result.out_dir, runlog.LOG_TXT))
+    assert result.results["integrity"]["links"]["broken"] == 0
+
+
+@requires_ffmpeg
+def test_the_summary_the_window_gets_carries_the_measured_values(normal_clip, tmp_path):
+    """The table, the log file and the console must agree, so they share one dict."""
+    seen = []
+    options = Options(paths=[normal_clip], out_dir=str(tmp_path / "out"), per_clip=1,
+                      min_gap=1.0, select_mode=MODE_COUNT)
+    run_batch(options, on_clip_done=seen.append)
+    assert len(seen) == 1
+    values = seen[0]["values"]
+    for key in ("file", "candidates", "confidence_spread", "look_applied", "elapsed_s",
+                "decode_path", "frames_delivered"):
+        assert key in values, key
+
+
+@requires_ffmpeg
+def test_the_side_file_sizes_are_measured_after_everything_is_written(normal_clip, tmp_path):
+    """results.json is written after the check runs, so its size is taken again."""
+    from framepicker import runlog
+
+    result = _run([normal_clip], tmp_path, per_clip=1, min_gap=1.0, select_mode=MODE_COUNT)
+    side = result.results["integrity"]["side_files"]
+    for name in (report.RESULTS_JSON, runlog.LOG_TXT, runlog.LOG_JSONL):
+        assert side[name] and side[name] > 0, (name, side)
+    on_disk = json.load(open(os.path.join(result.out_dir, report.RESULTS_JSON), encoding="utf-8"))
+    assert on_disk["integrity"]["side_files"][report.RESULTS_JSON] > 0
