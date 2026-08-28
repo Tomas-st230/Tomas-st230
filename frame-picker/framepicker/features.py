@@ -591,3 +591,126 @@ def vertical_line_share(frame: np.ndarray) -> float | None:
     if counted < VERTICAL_MIN_LINES:
         return None
     return vertical / float(counted)
+
+
+# --------------------------------------------------------------------------
+# Graphic composition: symmetry, repetition, negative space
+# --------------------------------------------------------------------------
+#
+# What aerial work is actually judged on right now is not "a nice view": the
+# 2026 SkyPixel winners and the trend write-ups all describe the same three
+# things - top-down symmetry, rhythmic pattern, and a small subject in a lot
+# of empty space. See README for the sources.
+#
+# All three are measurable, so they are measured rather than described. Each
+# one is a share or a correlation in 0..1, and each returns ``None`` when the
+# frame gives it nothing to work with.
+
+#: Side of the thumbnail the symmetry test runs on. Small on purpose: a
+#: symmetric composition is symmetric in shapes, not in pixels.
+SYMMETRY_SIZE = 128
+#: Side of the grid the repetition test runs on.
+PATTERN_SIZE = 192
+#: Repetition below this correlation is texture, not pattern.
+PATTERN_MIN_CORRELATION = 0.15
+#: Grey levels of structure the high-pass has to leave behind before the
+#: autocorrelation is worth normalising. Below this the frame is a smooth
+#: gradient and its "repetition" is filter residue.
+PATTERN_MIN_STRUCTURE = 1.0
+#: Subject shares that count as "a subject in negative space". Above the
+#: upper bound the subject fills the frame; below the lower one there is no
+#: subject, only noise.
+NEGATIVE_SPACE_SUBJECT = (0.005, 0.18)
+
+
+def symmetry(frame: np.ndarray) -> float | None:
+    """How closely the frame mirrors itself, 0..1.
+
+    The better of the two axes, because a top-down shot of a road is
+    symmetric left-to-right and a reflection in water is symmetric
+    top-to-bottom, and both are the thing being looked for.
+
+    The mirror difference is divided by the frame's own variation. Without
+    that, every low-contrast frame scores high simply because all its
+    differences are small - the same scale mistake that once multiplied a
+    dark sunset's saturation by 2.5. ``None`` when the frame has nothing to
+    mirror at all.
+    """
+    import cv2
+
+    small = cv2.resize(to_luma(frame).astype(np.float32),
+                       (SYMMETRY_SIZE, SYMMETRY_SIZE), interpolation=cv2.INTER_AREA)
+    small /= 255.0
+    variation = float(np.abs(small - small.mean()).mean())
+    if variation < 1e-4:
+        return None                      # a blank frame is not "symmetric"
+    scale = 2.0 * variation
+    horizontal = 1.0 - float(np.abs(small - small[:, ::-1]).mean()) / scale
+    vertical = 1.0 - float(np.abs(small - small[::-1, :]).mean()) / scale
+    return float(max(0.0, min(1.0, max(horizontal, vertical))))
+
+
+def pattern_repetition(frame: np.ndarray) -> float | None:
+    """Strength of the strongest repeating structure in the frame, 0..1.
+
+    Autocorrelation through the FFT, with the zero-shift peak and its
+    immediate neighbourhood removed - what is left is "this frame repeats
+    itself every N pixels", which is what a field, a roof, a row of trees or
+    a set of waves does and an unstructured view does not.
+    """
+    import cv2
+
+    grid = cv2.resize(to_luma(frame).astype(np.float32),
+                      (PATTERN_SIZE, PATTERN_SIZE), interpolation=cv2.INTER_AREA)
+    # High-pass first. A sky gradient autocorrelates strongly at every shift
+    # and would otherwise read as "pattern" in half the frames of a sunset
+    # clip; what is wanted is repeating structure, which survives the filter.
+    grid -= cv2.GaussianBlur(grid, (0, 0), PATTERN_SIZE / 16.0)
+    # The filter leaves residue along the borders whatever the content is, and
+    # the FFT wraps around, so the border is dropped and the rest is tapered.
+    edge = PATTERN_SIZE // 8
+    grid = grid[edge:PATTERN_SIZE - edge, edge:PATTERN_SIZE - edge]
+    window = np.hanning(grid.shape[0])[:, None] * np.hanning(grid.shape[1])[None, :]
+    grid = grid * window
+    grid -= grid.mean()
+    if float(grid.std()) < PATTERN_MIN_STRUCTURE:
+        return 0.0                       # smooth: a gradient, fog, open water
+    energy = float((grid ** 2).sum())
+    if energy <= 1e-6:
+        return None                      # a flat frame repeats nothing
+    spectrum = np.fft.rfft2(grid)
+    correlation = np.fft.irfft2(spectrum * np.conjugate(spectrum), grid.shape)
+    correlation /= energy
+    # Ignore shifts smaller than a sixteenth of the frame: those are just the
+    # image overlapping itself.
+    guard = max(2, grid.shape[0] // 16)
+    masked = correlation.copy()
+    masked[:guard, :guard] = 0.0
+    masked[:guard, -guard:] = 0.0
+    masked[-guard:, :guard] = 0.0
+    masked[-guard:, -guard:] = 0.0
+    peak = float(masked.max())
+    if peak < PATTERN_MIN_CORRELATION:
+        return 0.0
+    return float(min(1.0, peak))
+
+
+def negative_space(subject_rel: float | None, separation: float | None) -> float | None:
+    """A small, clean subject in a lot of empty frame, 0..1.
+
+    ``None`` when there is no subject measurement - "no subject found" is not
+    the same as "a subject beautifully placed in emptiness".
+    """
+    if subject_rel is None:
+        return None
+    low, high = NEGATIVE_SPACE_SUBJECT
+    rel = float(subject_rel)
+    if rel < low or rel > high:
+        return 0.0
+    # Peaks in the middle of the band and falls off toward both ends.
+    middle = (low + high) / 2.0
+    span = (high - low) / 2.0
+    closeness = 1.0 - abs(rel - middle) / span
+    if separation is None:
+        return float(max(0.0, min(1.0, closeness)))
+    return float(max(0.0, min(1.0, closeness * (0.5 + 0.5 * float(separation)))))

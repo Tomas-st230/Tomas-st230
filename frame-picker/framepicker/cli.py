@@ -502,7 +502,16 @@ def analyse_clip(
                 item["subject_separation"] = separation
                 item["thirds_distance"] = features.thirds_distance(cx, cy)
         item["horizon_tilt"] = features.horizon_tilt(frame)
+        # What aerial work is actually judged on: symmetry, repetition, and a
+        # small subject in a lot of space. Measured here, weighed in scoring.
+        item["symmetry"] = features.symmetry(frame)
+        item["pattern_repetition"] = features.pattern_repetition(frame)
+        item["negative_space"] = features.negative_space(
+            item["subject_rel"], item["subject_separation"])
         score, reasons = scoring.score_frame_explained(item)
+        # The component values, kept as numbers as well as sentences: the
+        # calibration tool needs to read what the score was built from.
+        item["components"] = scoring.component_values(item)
         candidates.append(Candidate(
             index=i,
             t=timestamps[i],

@@ -120,8 +120,21 @@ with no detector is not a frame with no faces.
 ```bash
 python -m framepicker VIDEO... [--out DIR] [--per-clip 6] [--fps 2]
                                [--min-gap 2.0] [--convert-log auto|on|off]
-                               [--lut path.cube] [--jobs N] [--no-faces]
+                               [--lut path.cube] [--look auto] [--jobs N]
+                               [--proxy auto|off] [--keyframes] [--no-faces]
 ```
+
+The whole folder, the drone LUT, the look chosen per clip, oldest file first:
+
+```powershell
+python -m framepicker "D:\tomas\Videos\DJI Drone foot" `
+  --lut "D:\LUT\DJI Lito X1 D-Log M to Rec.709 LUT.cube" `
+  --look auto --min-score 0.65
+```
+
+`--out` defaults to `frame-picker-out` inside `D:\tomas\Videos\DJI Drone foot`
+when that folder exists, and to `frame-picker-out` in the current directory
+otherwise.
 
 `VIDEO...` takes files, **folders**, or **wildcards**. The expansion happens
 inside the tool, not in the shell, because neither `cmd` nor PowerShell globs
@@ -148,7 +161,8 @@ timestamps you can see that rather than wonder.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--out` | `frame-picker-out` | output directory |
+| `--out` | `frame-picker-out`, or `D:\tomas\Videos\DJI Drone foot\frame-picker-out` when that folder exists | output directory; **every run gets its own dated subfolder inside it** |
+| `--no-run-folder` | off | write straight into `--out` instead of a per-run subfolder |
 | `--select` | `threshold` | `threshold` keeps every frame above `--min-score`; `count` aims at `--per-clip` |
 | `--min-score` | `0.65` | score a frame has to reach in threshold mode — **an uncalibrated starting value** |
 | `--max-per-clip` | `12` | upper bound per clip in threshold mode (`0` = no bound) |
@@ -160,7 +174,7 @@ timestamps you can see that rather than wonder.
 | `--lut` | – | `.cube` applied **only to clips detected as log**, for analysis *and* for the exported image |
 | `--lut-all` | off | force `--lut` onto every clip, log or not |
 | `--normalise-strength` | `1.0` | strength of the no-LUT log fallback; `0` turns it off |
-| `--look` | `none` | named look for the exported stills: `nature`, `city`, `none` |
+| `--look` | `none` | look for the exported stills: `auto`, `nature`, `city`, `none` |
 | `--look-strength` | `0.6` | how far toward the look's targets to travel |
 | `--jobs` | auto | files processed in parallel (auto = `min(4, cpu_count)`) |
 | `--no-faces` | off | skip face detection entirely |
@@ -170,6 +184,9 @@ timestamps you can see that rather than wonder.
 | `--global-top` | `20` | frames on the "best of the whole batch" section (`0` turns it off) |
 | `--max-candidates` | `3000` | upper bound on analysis frames buffered per clip |
 | `--hwaccel` | `auto` | `auto` tries CUDA, `none` forces CPU |
+| `--no-gpu-scale` | off | do not scale on the GPU even when the ffmpeg build supports it |
+| `--proxy` | `auto` | use a DJI `.LRF` proxy for analysis when one sits next to the file; `off` always reads the master |
+| `--keyframes` | off | decode only keyframes — much faster, and the sampling grid becomes the camera's keyframe interval |
 | `--order` | `date` | processing order: `date` = oldest file first, `name` = by filename, `none` = as given |
 
 GUI — a wrapper around the same functions. There is no second code path, and
@@ -189,22 +206,51 @@ One window:
   file" override, the log-detection mode, the quality threshold, the per-clip
   bound, and the output folder
 * a table with one row per file: **profile** (log / normal), **colour** (LUT /
-  normalised / untouched), **decode path** (GPU / CPU), frames picked, status.
+  normalised / untouched), **look** (which one was actually applied — the answer
+  `auto` resolved to), **decode path** (GPU / CPU), frames picked, status.
   A skipped file says so and carries the reason as a tooltip — it never goes
   blank.
 * a progress bar, the current status line, cancel, "open results folder" and
   "open report"
 
-Cancelling deletes the partial output.
+The look box includes **`automatiškai (pagal sceną)`**, and the file dialogs
+open in `D:\tomas\Videos\DJI Drone foot` when that folder exists.
+
+**Cancelling means stopping.** The partial output is deleted, the folder this
+run created goes with it, the file list is cleared, and the window returns to a
+state where a new set of files can be dropped straight in. While a run is going
+the file list is frozen and says so, rather than accepting files that would land
+in a table row nobody is filling. "Open results folder" opens *this run's*
+folder, not the parent.
+
+Closing the window always works: the run is asked to stop and given at most
+three seconds to notice, then the window closes regardless. Nothing in this
+program can refuse a close or hold up a shutdown — the keep-awake flag is
+`ES_SYSTEM_REQUIRED` only, never `ES_DISPLAY_REQUIRED`, and it is released in a
+`finally` block.
 
 ### Output
 
+Every run creates its own folder, named after the moment it started:
+
 ```
 frame-picker-out/
-  <clip>_01_0004.000s_0.636.jpg     # sortable by rank
-  results.json                       # everything, machine-readable
-  report.html                        # self-contained, images inlined
+  run-20260828-163550/
+    <clip>_01_0004.000s_0.636.jpg     # sortable by rank
+    results.json                       # everything, machine-readable
+    report.html                        # self-contained, images inlined
+  run-20260828-171204/
+    ...
 ```
+
+This is not tidiness for its own sake. The 163-file run wrote into a folder
+that already held the previous run's stills, and the end-of-run check
+correctly reported 12 files that nothing referred to - the report and the
+folder no longer agreed with each other. One folder per run makes that
+impossible, keeps each run usable as a deliverable on its own, and means a
+cancelled run can delete everything it made, including the folder.
+`--no-run-folder` restores the old behaviour. `results.json` records the
+folder it was written into under `output_dir`.
 
 ### End-of-run check
 
@@ -265,8 +311,41 @@ as `None` unless the candidate lines agree on an angle, sit at the same height,
 and have genuinely different brightness on each side — otherwise choppy water
 and forest canopy report a perfectly level horizon that is not there.
 
-`composition` blends the rule-of-thirds placement with **subject separation**:
-how much more salient the main blob is than everything around it.
+`composition` blends three things, each dropping out if it cannot be measured:
+
+| Part | Share | What it is |
+|---|---|---|
+| placement | 0.55 | distance from the nearest rule-of-thirds intersection |
+| separation | 0.20 | how much more salient the main blob is than its surroundings |
+| graphic | 0.25 | the **best** of symmetry, pattern repetition and negative space |
+
+The third part is there because the rule of thirds is not what aerial work is
+currently judged on. The 2026 SkyPixel winners and this year's trend write-ups
+describe the same three things instead — top-down symmetry, rhythmic pattern
+turning a landscape into a graphic, and a small subject in a lot of empty space
+([SkyPixel 2026 winners](https://uavcoach.com/skypixel-2026/),
+[The Drone Girl](https://www.thedronegirl.com/2026/04/29/best-drone-photos-2026-skypixel/),
+[Envato Elements](https://elements.envato.com/learn/photography-trends)). All
+three are measurable, so they are measured rather than described:
+
+* **symmetry** — mean absolute difference between the frame and its mirror,
+  divided by the frame's own variation. That division matters: without it every
+  low-contrast frame scores 0.9 simply because all its differences are small
+  (uniform noise measured 0.91 before the fix, 0.30 after). `None` for a blank
+  frame, because a blank frame is not symmetric, it is empty.
+* **pattern repetition** — FFT autocorrelation after a high-pass and a Hann
+  window, with the zero-shift neighbourhood masked out. Measured: stripes 0.97,
+  a checkerboard 0.95, a sky gradient 0.00, uniform noise 0.00. Without the
+  high-pass a smooth gradient scored 1.0, because a gradient correlates with
+  itself at every shift.
+* **negative space** — a subject occupying 0.5–18 % of the frame, weighted by
+  how cleanly it separates. Outside that band it returns 0.0, and `None` when
+  there is no subject measurement at all.
+
+"Best of the three", not the average: a frame built on symmetry owes nothing to
+pattern, and one built on negative space owes nothing to either. A top-down
+pattern shot with no identifiable subject now gets a composition score instead
+of `None`.
 
 Four principles, stated so they can be argued with:
 
@@ -290,17 +369,64 @@ no reasons is indistinguishable from a random number.
 
 ### Log / flat footage and the LUT
 
-Detection order: `--convert-log` flag → colour metadata → filename hint →
-**measured frame flatness** → off.
+Detection order, strongest evidence first:
 
-The measurement step exists because the first three usually say nothing about a
-real DJI file: DJI does not put the picture profile in the filename, and often
-does not tag the colour transfer either. So twelve frames spread over the clip
-are decoded and two things are measured — the luma p1–p99 span and the mean HSV
-saturation — which is exactly what a log profile compresses. Both have to be
-below their threshold for the clip to count as log. It is still a guess, it is
-still labelled as one, and the measured numbers go into `results.json` so the
-thresholds can be calibrated.
+1. `--convert-log on|off` — you said so.
+2. **`NAME.SRT`, the caption sidecar** — the camera said so, in words.
+3. A log colour-transfer or wide-primaries tag.
+4. A filename hint (`dlog`, `hlog`, `slog`, `flat`, …).
+5. **A DJI camera plus a 10-bit pixel format.**
+6. Measured frame flatness — recorded as *suspicion only*, never acted on.
+
+**Why this needed rebuilding.** The LUT was not landing on the D-Log footage,
+and the reason was not the code. Measured across 163 files from one card,
+every clip reports:
+
+```
+color_transfer: bt709   color_primaries: bt709   color_space: bt709
+range: tv   pix_fmt: yuv420p10le   profile: Main 10
+```
+
+The picture profile is nowhere in the video stream. It is identical for D-Log M
+and for Normal colour, so steps 3 and 4 above can never fire on this camera.
+Two things do carry the answer:
+
+**`NAME.SRT` — DJI "Video Captions".** One caption per frame with the camera
+settings, including the only plain-text statement of the profile:
+
+```
+FrameCnt: 1, DiffTime: 33ms
+2026-08-22 19:15:39.000
+[iso: 100] [shutter: 1/500.0] [fnum: 1.7] [ev: 0] [color_md: dlog_m] [focal_len: 24.00]
+```
+
+`color_md` is read from the first caption (`dlog_m`, `d-log`, `d_cinlike`,
+`hlg`, `default` — compared with the punctuation stripped, because DJI spells
+it differently per model). This is **decisive in both directions**: it is what
+finally keeps the LUT *off* the Normal-colour clips in a mixed dump, and it is
+the one signal marked `is_a_guess: false` without a flag. Turn Video Captions
+on in DJI Fly and the profile stops being guessed at all.
+
+**The container tags plus the bit depth.** Every file on the card — MP4 and LRF
+alike — carries `encoder: DJI Lito X1` at container level (in
+`probe.extra.format_tags`). DJI's 10-bit recording modes are D-Log, D-Log M and
+HLG; Normal colour records 8-bit
+([DJI](https://store.dji.com/content/what-is-10-bit),
+[eDrones](https://www.edrones.review/understanding-10-bit-d-log-m-and-hlg-in-videography/)).
+So a DJI file in a 10-bit pixel format was not shot in Normal colour, whatever
+its colour tags claim. That inference is gated on the encoder tag (a 10-bit
+Rec.709 file from another camera is untouched), is reported as a guess with the
+evidence in the message, and `--convert-log off` overrides it. If the clip is
+actually HLG rather than D-Log, a D-Log LUT is the wrong conversion — so when
+the profile is known to be HLG and a LUT is applied, the report says exactly
+that instead of quietly grading it.
+
+**Measured flatness stays evidence, not a trigger.** Across those 163 files the
+luma span ran 0.155–0.925 and mean saturation 0.074–0.765 in one continuous
+distribution with no gap: the measurement was reading the *scene*, not the
+profile. Four dark sunsets fell under the thresholds and had their saturation
+multiplied by 2.5, which is what wrecked two named exports. It is still
+measured and still reported, and it no longer changes a pixel.
 
 **A LUT follows the log verdict, per clip.** `--lut look.cube` is applied only
 to the clips detected as log — a `.cube` is a log-to-display conversion, and
@@ -318,6 +444,37 @@ Aptiktas plokščias (log) profilis. Pagrindas: išmatuotas kadrų plokštumas
 Išmatuota iš kadrų: šviesumo diapazonas 0.412, sodrumas 0.155
 Analizei pritaikytas LUT: D:\LUT\DJI_DLogM_to_Rec709.cube
 ```
+
+### The `.LRF` proxy — and what else is in it
+
+DJI writes a `NAME.LRF` next to every take. Opened and measured, one of
+Tomas's:
+
+| Stream | What it is |
+|---|---|
+| 0 | H.264 **1280x720**, 8.03 Mbit/s, 29.97 fps, 20.354 s, `yuv420p`, tagged bt709 |
+| 1 | data, codec tag `djmd`, 75.7 kbit/s — a binary `dvtm_Lito_X1.proto` protobuf: 1831 records over 610 frames, carrying the serial number, firmware strings and `DJI FC9589`. **No plain text**, so GPS and gimbal values would need DJI's undocumented schema; `color_md` is *not* in it |
+| 2 | MJPEG 960x540, `attached_pic` — a cover thumbnail |
+| format tags | `encoder: DJI Lito X1`, `creation_time` |
+
+So: a full-length 720p proxy of the same take, a thumbnail, and telemetry that
+is not readable without DJI's proto file. The proxy is the useful part. Analysis
+runs at 640 px anyway, so **`--proxy auto` (the default) analyses the `.LRF` and
+exports from the master.** Before it is used it is probed and checked against
+the master — duration within 0.5 s or 2 %, the same aspect ratio, and a long
+edge no smaller than the analysis size — and every acceptance and every refusal
+is named in the report:
+
+```
+Analizei naudojamas gretimas peržiūros failas DJI_0243_D.LRF (1280x720).
+Eksportuojami kadrai visada imami iš originalo.
+Peržiūros failas DJI_0244_D.LRF nenaudojamas: duration differs by 3.100 s (max 0.500 s).
+```
+
+What this costs in accuracy is not measured on Tomas's footage yet: the proxy
+is 8 Mbit/s of 720p, so fine detail is softer than the master's, and sharpness
+is a *within-clip* rank, which softening compresses. If two runs of the same
+folder disagree about which frames are best, `--proxy off` is the comparison.
 
 ### Looks
 
@@ -342,6 +499,47 @@ exports: the contrast stretch is capped at 1.6×, the saturation multiplier at
 1.45×, and the highlight rolloff is asymptotic so a bright sky keeps its
 gradation instead of becoming one flat white shape. Without the contrast cap a
 foggy frame asks for a 140× stretch and its last trace of colour explodes.
+
+**Order matters.** The LUT is a *conversion* and goes first, inside the ffmpeg
+call that extracts the frame; the look is a *taste decision* and goes last, on
+the already-corrected image. The no-LUT normalisation only ever runs when there
+is no LUT, because both do the same job.
+
+#### `--look auto`
+
+Eight frames spread across the clip are measured and the look is chosen from
+what is in them — once per clip, never per frame, because a look that changed
+from shot to shot inside one take would be worse than none.
+
+What is measured (all shares of the frame, `features.scene_signature`):
+vegetation (green hues), sky and water (blue hues), warmth (red through
+orange), grey (unsaturated mid-tones), and the share of the straight lines in
+the frame that stand up.
+
+```
+nature = colour / (colour + grey)                colour = vegetation + sky + warm
+city   = grey   / (colour + grey) * structure    structure = 0.4 + 0.6 * vertical_share
+```
+
+Both sides are **shares of each other**, never compared with a fixed
+threshold. That is deliberate: a D-Log frame is desaturated everywhere, so
+counting grey pixels against a constant labels every ungraded sunset a city —
+the same scale mistake that once multiplied a dark sunset's saturation by 2.5.
+
+If the two scores are within 0.08 of each other, **no look is applied** and the
+report says the evidence was too close to call. An undecided answer is a real
+answer.
+
+```
+Automatiškai parinktas profilis „gamta“ (gamta 0.71 / miestas 0.12, išmatuota 8 kadr.).
+Automatinis profilis nenustatytas: gamta 0.34 ir miestas 0.29 skiriasi mažiau nei 0.08.
+```
+
+One honest limitation, measured on Tomas's own frames: on aerial footage the
+vertical-line evidence is almost always near zero (0.00–0.03 on a village shot
+from above, because buildings foreshorten into roof lines when you look down at
+them). So in practice the decision is carried by colour mass, and the printed
+numbers show it. A village at dusk with a warm sky comes out `nature`.
 
 ### Confidence
 
@@ -388,6 +586,38 @@ time gap, capped) are all still reported.
 
 ---
 
+## Calibration — making the weights yours
+
+The weights above are chosen numbers. `framepicker/learn.py` is the only path
+from your own picks to different ones:
+
+```bash
+# 1. run a batch, then copy the frames you would actually use into one folder
+python -m framepicker.learn "OUT/run-20260828-163550/results.json" --picks "D:/keepers"
+```
+
+It matches your kept frames against the run (by filename without extension, so
+re-saving a JPEG as PNG or moving it does not break the link), then for each
+score component reports the mean among the kept frames, the mean among the
+discarded ones, and Cohen's *d* between them. Then it proposes weights in
+proportion to how well each component separates your picks — **and checks its
+own proposal** by re-ranking every frame with them and reporting how many of
+your picks would land in the top 20, before and after.
+
+Three things it will not do:
+
+* Nothing is proposed below 20 kept and 20 discarded frames. A weight vector
+  from six examples is noise with a decimal point, and it says so instead.
+* No component is ever deleted or allowed to take over: every weight stays
+  inside 0.05–0.60, whatever the numbers say.
+* **The weights are never applied automatically.** They are printed, with the
+  line telling you to edit `WEIGHTS` in `framepicker/scoring.py` yourself. A bad
+  evening of picking must not be able to quietly rewrite the tool's judgement.
+
+If the proposal does not rank your picks any higher, the output says that too:
+that means the components do not explain your taste, and the honest conclusion
+is to leave the weights alone.
+
 ## Measured performance
 
 Rule: no speed claim that no run produced. The tool prints its own throughput
@@ -409,6 +639,69 @@ about real camera footage. Synthetic `testsrc2` is not representative content �
 it is uniform enough that the confidence check correctly reported the ranking as
 uninformative. Measure on real clips before quoting anything.
 
+### Where the time actually goes
+
+Measured on one real DJI file (`DJI_20260822191538_0243_D.LRF`, 1280x720 H.264,
+8.0 Mbit/s, 29.97 fps, 20.35 s) on the same 4-core container, CPU decode,
+analysis at 640 px:
+
+| Step | Cost |
+|---|---|
+| decode + scale, `--fps 2`, every frame decoded | 1.19 s (17x realtime) |
+| decode + scale, `--fps 2`, `--keyframes` | **0.40 s (51x realtime)** |
+
+And the same measurement against a 4K master of the same content (3840x2160,
+10-bit, 130 Mbit/s, 60 fps - the resolution, bit depth and bitrate of Tomas's
+own files, transcoded to H.264 because this container has no GPU). Normalised
+to **seconds of work per second of footage**, so the two lengths are
+comparable:
+
+| Analysed from | Mode | s per s of footage | vs 4K, every frame |
+|---|---|---|---|
+| 4K 10-bit master | every frame | 0.418 | 1.0x |
+| 4K 10-bit master | `--keyframes` | 0.077 | **5.4x faster** |
+| 720p `.LRF` proxy | every frame | 0.061 | **6.9x faster** |
+| 720p `.LRF` proxy | `--keyframes` | 0.022 | **19x faster** |
+
+Read those as ratios, not as promises: this is CPU H.264 decode on a 4-core
+container, while Tomas's run used CUDA on HEVC 10-bit. The ordering is the
+point - the proxy is worth roughly as much as keyframe-only decoding, and the
+two combine.
+
+Per analysis frame, all features together cost about 52 ms:
+
+| Feature | ms/frame | Feature | ms/frame |
+|---|---|---|---|
+| saliency subject | 11.5 | face detect (YuNet) | 9.2 |
+| horizon tilt | 10.7 | sharpness | 8.1 |
+| colour histogram | 4.3 | colourfulness | 3.3 |
+| symmetry | 2.3 | pattern repetition | 2.2 |
+| dynamic range | 2.3 | motion | 1.2 |
+| dHash | 1.1 | exposure clipping | 0.6 |
+
+So on Tomas's 163-file run (3840x2160, 59.94 fps, HEVC 10-bit, 5077 s of
+footage, 4063 s wall clock with 4 files in parallel), the features were not the
+bottleneck: a 137 s clip evaluated 246 candidates, which is about 13 s of
+feature work out of 527 s of elapsed time. The rest was **decoding 8200 frames
+of 4K 10-bit HEVC in order to keep 274 of them.** That is what the three new
+switches attack:
+
+* `--proxy auto` (default) — read the 720p `.LRF` instead of the 4K master.
+* GPU scaling — `-hwaccel cuda` alone decodes on the GPU and then copies every
+  full-size frame back to system memory. With `scale_cuda`/`scale_npp` the
+  frames are dropped and shrunk *before* the copy. The chain that will be used
+  is tested with a single-frame decode first, exactly like `-hwaccel` itself,
+  and falls back silently to the plain path if the build cannot do it — so this
+  cannot make a working run stop working.
+* `--keyframes` — decode intra frames only. Measured 3.0x faster above, and on
+  that file it yielded 40 frames where the full decode yielded 41, because DJI
+  writes a keyframe roughly every half second. The report always states how
+  many frames were actually sampled and at what effective rate.
+
+One number to watch in the per-clip report: `elapsed_s` is wall-clock while up
+to four files are processed at once, so a 137 s clip showing 527 s is not 3.8x
+realtime per stream - divide by `--jobs`.
+
 Hardware decode is attempted, not assumed: the tool runs one `-hwaccel cuda`
 single-frame decode, and falls back to CPU only if that actually fails. Which
 path was used, and the exact reason for any fallback, goes into the console and
@@ -427,7 +720,11 @@ framepicker/          runs with no Qt and no display (a test asserts it)
   scoring.py          pure feature dict -> score + reasons
   select.py           ranking + diversity constraints + shortfall reasons
   export.py           full-resolution extraction of the chosen timestamps
-  report.py           results.json + report.html
+  grading.py          looks as targets, and the --look auto decision
+  sidecar.py          the .SRT and .LRF files DJI writes next to the video
+  learn.py            calibration: your own picks -> proposed weights
+  keepawake.py        keeps the machine awake while a run is going, screen free
+  report.py           results.json + report.html + the link check
   proc.py             the ONLY module that calls subprocess
   strings_lt.py       every Lithuanian user-facing string
   models/             YuNet ONNX + its MIT licence
@@ -522,8 +819,19 @@ the window grew a settings block and a per-file table.
 ## Still open
 
 * The weights, the threshold, and the diversity thresholds are all uncalibrated
-  starting values. Calibrating them needs a batch of Tomas's own footage plus
-  his own picks to compare against; nothing here can substitute for that.
+  starting values. `framepicker/learn.py` is now the path to calibrating them,
+  but it needs at least 20 frames Tomas actually kept; until those exist the
+  numbers stay chosen rather than measured.
+* What the `.LRF` proxy costs in ranking accuracy on his own footage is
+  untested. The comparison is one run with `--proxy off`.
+* The `djmd` telemetry stream in the `.LRF` (GPS, gimbal angles, altitude) is a
+  binary `dvtm_Lito_X1.proto` protobuf with no public schema. If DJI's
+  `color_md` is worth having per frame rather than per clip, the `.SRT` route
+  gives it without reverse-engineering anything.
+* On aerial footage the vertical-line evidence in `--look auto` is nearly always
+  zero, so the nature/city decision is effectively colour-based. If that turns
+  out to pick wrong on urban footage, the fix is a better structure measurement,
+  not a bigger threshold.
 * Whether `--min-score 0.65` is a sensible default is unknown. It was chosen
   from the structure of the score, not from measurement: on the synthetic
   `testsrc2` fixtures the best frame of a clip scores 0.64, so that clip

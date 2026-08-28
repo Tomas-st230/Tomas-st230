@@ -74,8 +74,19 @@ TILT_MAX_PENALTY = 0.25
 
 # -- composition -----------------------------------------------------------
 #: Share of the composition term carried by how cleanly the subject separates
-#: from its surroundings; the rest is the rule-of-thirds placement.
+#: from its surroundings; the rest is the rule-of-thirds placement. Kept for
+#: the two-argument form of :func:`composition_from`.
 SEPARATION_SHARE = 0.25
+
+#: How the composition term is divided when all three parts are available.
+#:
+#: The third one exists because the rule of thirds is not what aerial work is
+#: currently judged on. The 2026 SkyPixel winners and every trend write-up
+#: describe the same three things instead: top-down symmetry, rhythmic
+#: pattern, and a small subject in a lot of empty space (sources in the
+#: README). All three are measured in :mod:`framepicker.features`; the best of
+#: them carries this share, because a frame needs to do only one of them well.
+COMPOSITION_SHARES = {"placement": 0.55, "separation": 0.20, "graphic": 0.25}
 
 # -- confidence (TRAP-11) --------------------------------------------------
 #: Number of top candidates whose spread decides whether the ranking is
@@ -133,14 +144,44 @@ def moment_component(motion_rank: float | None, face_present: bool | None) -> fl
     return _clamp01(_clamp01(motion_rank) * weight)
 
 
-def composition_from(thirds_dist: float | None, separation: float | None) -> float | None:
-    """Thirds placement, plus how cleanly the subject stands out."""
-    if thirds_dist is None:
+def graphic_component(
+    symmetry: float | None = None,
+    pattern: float | None = None,
+    negative_space: float | None = None,
+) -> float | None:
+    """The best of the three graphic qualities, or ``None`` if none was measured.
+
+    Best, not average: a frame that is strongly symmetric owes nothing to
+    pattern, and one built on negative space owes nothing to either.
+    """
+    values = [v for v in (symmetry, pattern, negative_space) if v is not None]
+    if not values:
         return None
-    placement = _clamp01(1.0 - _clamp01(thirds_dist))
-    if separation is None:
-        return placement
-    return _clamp01((1.0 - SEPARATION_SHARE) * placement + SEPARATION_SHARE * _clamp01(separation))
+    return _clamp01(max(values))
+
+
+def composition_from(
+    thirds_dist: float | None,
+    separation: float | None,
+    graphic: float | None = None,
+) -> float | None:
+    """Placement, subject separation and graphic quality - whichever exist.
+
+    Every missing part drops out and the remaining shares are renormalised, so
+    a top-down pattern shot with no identifiable subject still gets a
+    composition score instead of ``None``.
+    """
+    parts: dict[str, float] = {}
+    if thirds_dist is not None:
+        parts["placement"] = _clamp01(1.0 - _clamp01(thirds_dist))
+    if separation is not None:
+        parts["separation"] = _clamp01(separation)
+    if graphic is not None:
+        parts["graphic"] = _clamp01(graphic)
+    if not parts:
+        return None
+    total = sum(COMPOSITION_SHARES[key] for key in parts)
+    return _clamp01(sum(COMPOSITION_SHARES[key] * value for key, value in parts.items()) / total)
 
 
 def composition_component(thirds_dist: float | None) -> float | None:
@@ -148,6 +189,62 @@ def composition_component(thirds_dist: float | None) -> float | None:
     if thirds_dist is None:
         return None
     return _clamp01(1.0 - _clamp01(thirds_dist))
+
+
+def component_values(features: dict) -> dict:
+    """The four components of the score, or however many could be measured.
+
+    Split out of :func:`score_frame_explained` so that the report, the tests
+    and :mod:`framepicker.learn` all read the same numbers the score was
+    built from. A component that could not be measured is simply absent -
+    never a zero.
+    """
+    color_rank = float(features.get("colorfulness_rank") or 0.0)
+    range_rank = float(features.get("dynamic_range_rank") or 0.0)
+    faces_known = features.get("face_max_rel") is not None
+
+    face_term = face_component(features.get("face_max_rel"))
+    land_term = landscape_component(color_rank, range_rank)
+
+    parts: dict[str, float] = {
+        "content": land_term if face_term is None else max(face_term, land_term),
+        "technical": technical_component(
+            float(features.get("sharpness_rank") or 0.0),
+            float(features.get("exposure_clip_low") or 0.0),
+            float(features.get("exposure_clip_high") or 0.0),
+            features.get("horizon_tilt"),
+        ),
+    }
+    composition = composition_from(
+        features.get("thirds_distance"),
+        features.get("subject_separation"),
+        graphic_component(
+            features.get("symmetry"),
+            features.get("pattern_repetition"),
+            features.get("negative_space"),
+        ),
+    )
+    if composition is not None:
+        parts["composition"] = composition
+    moment = moment_component(
+        features.get("motion_rank"),
+        bool(features.get("face_max_rel") or 0.0) if faces_known else None,
+    )
+    if moment is not None:
+        parts["moment"] = moment
+    return parts
+
+
+def score_from_components(parts: dict, weights: dict | None = None) -> float:
+    """Weighted mean of whatever components exist, renormalised over them."""
+    weights = weights or WEIGHTS
+    usable = {k: float(v) for k, v in parts.items() if v is not None and k in weights}
+    if not usable:
+        return 0.0
+    total = sum(weights[k] for k in usable)
+    if total <= 0:
+        return 0.0
+    return _clamp01(sum(weights[k] * v for k, v in usable.items()) / total)
 
 
 def score_frame_explained(features: dict) -> tuple[float, list[str]]:
@@ -159,31 +256,18 @@ def score_frame_explained(features: dict) -> tuple[float, list[str]]:
     ``None``: ``face_count``, ``face_max_rel``, ``subject_rel``,
     ``thirds_distance``.
     """
+    parts = component_values(features)
+    score = score_from_components(parts)
+    content = parts["content"]
+    technical = parts["technical"]
+    composition = parts.get("composition")
+    moment = parts.get("moment")
+    faces_known = features.get("face_max_rel") is not None
     sharp_rank = float(features.get("sharpness_rank") or 0.0)
     color_rank = float(features.get("colorfulness_rank") or 0.0)
     range_rank = float(features.get("dynamic_range_rank") or 0.0)
     clip_low = float(features.get("exposure_clip_low") or 0.0)
     clip_high = float(features.get("exposure_clip_high") or 0.0)
-
-    faces_known = features.get("face_max_rel") is not None
-    face_term = face_component(features.get("face_max_rel"))
-    land_term = landscape_component(color_rank, range_rank)
-    content = land_term if face_term is None else max(face_term, land_term)
-
-    technical = technical_component(sharp_rank, clip_low, clip_high, features.get("horizon_tilt"))
-    composition = composition_from(features.get("thirds_distance"), features.get("subject_separation"))
-    moment = moment_component(
-        features.get("motion_rank"),
-        bool(features.get("face_max_rel") or 0.0) if faces_known else None,
-    )
-
-    parts = {"content": content, "technical": technical}
-    if composition is not None:
-        parts["composition"] = composition
-    if moment is not None:
-        parts["moment"] = moment
-    total_weight = sum(WEIGHTS[k] for k in parts)
-    score = sum(WEIGHTS[k] * v for k, v in parts.items()) / total_weight
 
     reasons: list[str] = []
     if not faces_known:
@@ -213,11 +297,20 @@ def score_frame_explained(features: dict) -> tuple[float, list[str]]:
     if composition is None:
         reasons.append(S.reason_composition_unknown())
     else:
-        reasons.append(S.reason_thirds(float(features["thirds_distance"])))
+        if features.get("thirds_distance") is not None:
+            reasons.append(S.reason_thirds(float(features["thirds_distance"])))
+        else:
+            reasons.append(S.reason_no_subject_placement())
         if features.get("subject_rel") is not None:
             reasons.append(S.reason_subject_size(float(features["subject_rel"])))
         if features.get("subject_separation") is not None:
             reasons.append(S.reason_subject_separation(float(features["subject_separation"])))
+        if features.get("symmetry") is not None:
+            reasons.append(S.reason_symmetry(float(features["symmetry"])))
+        if features.get("pattern_repetition") is not None:
+            reasons.append(S.reason_pattern(float(features["pattern_repetition"])))
+        if features.get("negative_space") is not None:
+            reasons.append(S.reason_negative_space(float(features["negative_space"])))
     if moment is not None:
         reasons.append(S.reason_motion(float(features.get("motion_rank") or 0.0) * 100.0))
         if not (features.get("face_max_rel") or 0.0):

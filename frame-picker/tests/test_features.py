@@ -163,3 +163,63 @@ def test_a_frame_with_no_horizon_withholds_the_measurement():
     """None means "cannot tell", and must never be scored as "level"."""
     assert features.horizon_tilt(np.full((360, 640, 3), 120, np.uint8)) is None
     assert features.horizon_tilt(_noise(11, size=256)) is None
+
+
+# --------------------------------------------------------------------------
+# Graphic composition
+# --------------------------------------------------------------------------
+
+
+def _rgb(array):
+    return np.ascontiguousarray(array[:, :, None].repeat(3, 2).astype(np.uint8))
+
+
+def test_a_mirrored_frame_is_symmetric_and_noise_is_not():
+    rng = np.random.default_rng(0)
+    noise = (rng.random((240, 320, 3)) * 255).astype(np.uint8)
+    mirrored = noise.copy()
+    mirrored[:, 160:] = noise[:, :160][:, ::-1]
+    assert features.symmetry(mirrored) > 0.9
+    assert features.symmetry(noise) < 0.5
+
+
+def test_symmetry_is_measured_against_the_frames_own_contrast():
+    """A low-contrast frame must not be called symmetric just for being flat.
+
+    This is the same scale mistake that once multiplied a dark sunset's
+    saturation by 2.5, so it is tested rather than assumed.
+    """
+    rng = np.random.default_rng(1)
+    noise = (rng.random((240, 320, 3)) * 255).astype(np.uint8)
+    flat = (noise.astype(np.float32) * 0.05 + 120).astype(np.uint8)
+    assert features.symmetry(flat) < 0.5
+    assert features.symmetry(np.full((240, 320, 3), 120, np.uint8)) is None
+
+
+def test_repetition_finds_stripes_and_ignores_gradients():
+    stripes = np.zeros((240, 320, 3), np.uint8)
+    stripes[:, ::16] = 255
+    gradient = _rgb(np.tile(np.linspace(20, 230, 320), (240, 1)))
+    rng = np.random.default_rng(2)
+    noise = (rng.random((240, 320, 3)) * 255).astype(np.uint8)
+
+    assert features.pattern_repetition(stripes) > 0.8
+    assert features.pattern_repetition(gradient) == 0.0, "a sky gradient is not a pattern"
+    assert features.pattern_repetition(noise) == 0.0, "noise is not a pattern"
+
+
+def test_negative_space_needs_a_small_subject():
+    assert features.negative_space(0.09, 0.9) > 0.5
+    assert features.negative_space(0.60, 0.9) == 0.0
+    assert features.negative_space(0.0001, 0.9) == 0.0
+    assert features.negative_space(None, 0.9) is None
+
+
+def test_a_top_down_pattern_frame_still_gets_a_composition_score():
+    """No saliency subject, no thirds - but the frame is clearly composed."""
+    from framepicker import scoring
+
+    graphic = scoring.graphic_component(symmetry=0.95, pattern=0.9, negative_space=None)
+    assert graphic == pytest.approx(0.95)
+    assert scoring.composition_from(None, None, graphic) == pytest.approx(0.95)
+    assert scoring.composition_from(None, None, None) is None

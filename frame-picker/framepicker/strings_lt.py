@@ -659,3 +659,93 @@ GUI_STOPPING = "Stabdoma…"
 GUI_RESET = "Pradėti iš naujo"
 GUI_BUSY = "Vykdoma — naujų failų kelti negalima"
 GUI_RUN_DIR = "Šio paleidimo aplankas"
+
+
+def reason_symmetry(value: float) -> str:
+    return f"simetrija — {value:.2f} (0 = nesimetriška, 1 = veidrodinė)"
+
+
+def reason_pattern(value: float) -> str:
+    return f"pasikartojantis raštas — {value:.2f} (laukai, stogai, bangos)"
+
+
+def reason_negative_space(value: float) -> str:
+    return f"tuščia erdvė aplink objektą — {value:.2f}"
+
+
+def reason_no_subject_placement() -> str:
+    return "objekto vietos nustatyti nepavyko, kompozicija vertinta tik pagal grafinius požymius"
+
+
+# --------------------------------------------------------------------------
+# Kalibravimas pagal paties pasirinktus kadrus (framepicker.learn)
+# --------------------------------------------------------------------------
+
+LEARN_TITLE = "Kalibravimas: ką atrinkote patys, palyginti su tuo, ką atrinko įrankis"
+LEARN_COMPONENT_HEADER = (
+    "Dedamosios (vidurkis atrinktų / vidurkis atmestų / efekto dydis d / kiek išmatuota):"
+)
+LEARN_WEIGHTS_HEADER = "Pasiūlyti svoriai (dabartinis → pasiūlytas):"
+
+
+def learn_counts(frames: int, matched: int, given: int, dropped: int) -> str:
+    return (
+        f"Ataskaitoje kadrų: {frames}. Jūsų atrinkta: {given}, iš jų atpažinta {matched}. "
+        f"Neatrinktų kadrų: {dropped}."
+    )
+
+
+def learn_unmatched(names: str) -> str:
+    return f"Šių atrinktų failų ataskaitoje nėra (pervardinti ar iš kito paleidimo): {names}"
+
+
+def learn_component_line(
+    name: str, kept: float | None, dropped: float | None, effect: float | None,
+    kept_n: int, dropped_n: int,
+) -> str:
+    def number(value: float | None) -> str:
+        return "—" if value is None else f"{value:.3f}"
+
+    effect_text = "—" if effect is None else f"{effect:+.2f}"
+    return f"  {name:12s} {number(kept)} / {number(dropped)} / d={effect_text} / {kept_n}+{dropped_n}"
+
+
+def learn_weight_line(name: str, current: float, proposed: float) -> str:
+    return f"  {name:12s} {current:.3f} → {proposed:.3f}"
+
+
+def learn_not_enough(kept: int, dropped: int, min_kept: int, min_dropped: int) -> str:
+    return (
+        f"Svoriai neskaičiuoti: atrinkta {kept} (reikia bent {min_kept}), "
+        f"atmesta {dropped} (reikia bent {min_dropped}). Iš kelių pavyzdžių gautas "
+        "svoris yra atsitiktinumas, o ne kalibravimas."
+    )
+
+
+def learn_summary(kept: int, dropped: int) -> str:
+    return f"Skaičiuota iš {kept} atrinktų ir {dropped} atmestų kadrų."
+
+
+def learn_hit_rate(before: int, after: int, top_n: int) -> str:
+    return (
+        f"Patikra: tarp pirmų {top_n} kadrų jūsų pasirinkimų buvo {before}, "
+        f"su pasiūlytais svoriais būtų {after}."
+    )
+
+
+def learn_no_improvement() -> str:
+    return (
+        "Pasiūlyti svoriai nepagerino rezultato — tai reiškia, kad jūsų pasirinkimų "
+        "šios dedamosios neaiškina. Svorių keisti neverta."
+    )
+
+
+def learn_not_applied() -> str:
+    return (
+        "Svoriai NĖRA pritaikyti automatiškai. Jei norite juos naudoti, pakeiskite "
+        "WEIGHTS reikšmes framepicker/scoring.py — taip sprendimas lieka žmogaus rankose."
+    )
+
+
+def learn_cannot_read(path: str, detail: str) -> str:
+    return f"Nepavyko perskaityti {path}: {detail}"
