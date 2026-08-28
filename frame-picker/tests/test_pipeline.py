@@ -101,7 +101,8 @@ def test_log_clip_is_not_penalised(flat_clip, normal_clip, tmp_path):
                   select_mode=MODE_COUNT).results["clips"][0]
 
     assert flat["color"]["mode"] == "normalise"
-    assert S.normalisation_applied() in flat["notes"]
+    normalisation = flat["color"]["normalisation"]
+    assert S.normalisation_applied(normalisation["strength"], normalisation["saturation_gain"]) in flat["notes"]
 
     raw_saturation = max(f["features"]["saturation_mean"] for f in flat["frames"])
     assert raw_saturation > 0.0
@@ -389,3 +390,85 @@ def test_clips_are_reported_in_processing_order(normal_clip, blurred_clip, tmp_p
     names = [c["probe"]["name"] for c in result.results["clips"]]
     assert names == [os.path.basename(blurred_clip), os.path.basename(normal_clip)]
     assert result.results["options"]["order"] == "date"
+
+
+# --------------------------------------------------------------------------
+# Measured flatness must not trigger a colour transform
+# --------------------------------------------------------------------------
+
+
+def test_measured_flatness_only_suspects_it_never_acts(tmp_path):
+    """A dark sunset measures as flat as a log profile.
+
+    On 77 real DJI clips from one card - all the same picture profile -
+    luma_span ran 0.155 to 0.925 and saturation 0.074 to 0.765 in one
+    continuous distribution. Four sunset clips fell under the limits, had
+    their saturation multiplied by 2.5, and came out neon. So the
+    measurement may report a suspicion and may not act on it.
+    """
+    from framepicker.decode import LOG_STATS_MAX_LUMA_SPAN, LOG_STATS_MAX_SATURATION, detect_log
+    from framepicker.probe import ClipInfo
+
+    clip = ClipInfo(
+        path="/x/DJI_0001.MP4", name="DJI_0001.MP4", duration=10.0, fps=30.0,
+        width=3840, height=2160, codec="hevc", pix_fmt="yuv420p10le",
+        color_transfer=None, color_primaries=None, color_space=None, color_range=None,
+        nb_frames=300, size_bytes=1,
+    )
+    flat_looking = {"luma_span": 0.385, "saturation": 0.135, "frames_measured": 12}
+
+    verdict = detect_log(clip, "auto", flat_looking)
+    assert verdict.suspected is True, "the measurement should still be reported"
+    assert verdict.is_log is False, "and must not trigger a transform on its own"
+    assert verdict.source == "statistics"
+    assert flat_looking["luma_span"] < LOG_STATS_MAX_LUMA_SPAN
+    assert flat_looking["saturation"] < LOG_STATS_MAX_SATURATION
+
+    # Only an explicit instruction acts.
+    forced = detect_log(clip, "on", flat_looking)
+    assert forced.is_log is True and forced.is_a_guess is False
+
+
+def test_a_filename_hint_still_acts(tmp_path):
+    from framepicker.decode import detect_log
+    from framepicker.probe import ClipInfo
+
+    clip = ClipInfo(
+        path="/x/DJI_0001_DLOG.MP4", name="DJI_0001_DLOG.MP4", duration=10.0, fps=30.0,
+        width=3840, height=2160, codec="hevc", pix_fmt="yuv420p10le",
+        color_transfer=None, color_primaries=None, color_space=None, color_range=None,
+        nb_frames=300, size_bytes=1,
+    )
+    verdict = detect_log(clip, "auto", {"luma_span": 0.9, "saturation": 0.5, "frames_measured": 12})
+    assert verdict.is_log is True and verdict.source == "filename"
+
+
+def test_normalisation_saturation_gain_is_capped_low():
+    """The 2.5x gain that wrecked four sunsets is gone."""
+    import numpy as np
+
+    from framepicker.decode import NORMALISE_MAX_GAIN, estimate_normalisation
+
+    assert NORMALISE_MAX_GAIN <= 1.8, "a timid fallback, not a look"
+    dull = np.full((32, 32, 3), 90, dtype=np.uint8)
+    dull[:, :16, 0] = 110
+    normalisation = estimate_normalisation([dull])
+    assert normalisation is not None
+    assert normalisation.saturation_gain <= NORMALISE_MAX_GAIN
+
+
+def test_normalisation_strength_dials_it_down():
+    import numpy as np
+
+    from framepicker.decode import Normalisation
+
+    frame = np.random.default_rng(0).integers(60, 140, (32, 32, 3), dtype=np.uint8)
+    full = Normalisation(lo=60.0, hi=140.0, saturation_gain=1.6, strength=1.0).apply(frame)
+    half = Normalisation(lo=60.0, hi=140.0, saturation_gain=1.6, strength=0.5).apply(frame)
+    off = Normalisation(lo=60.0, hi=140.0, saturation_gain=1.6, strength=0.0).apply(frame)
+
+    def drift(a):
+        return float(np.abs(a.astype("float32") - frame.astype("float32")).mean())
+
+    assert drift(off) == 0.0
+    assert 0.0 < drift(half) < drift(full)

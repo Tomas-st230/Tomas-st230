@@ -116,6 +116,18 @@ def ffmpeg_missing(name: str) -> str:
     return f"Sistemoje nerastas {name}. Įdiekite ffmpeg ir įtraukite jį į PATH."
 
 
+def keep_awake_on() -> str:
+    return (
+        "Kol vyksta apdorojimas, kompiuteriui neleidžiama užmigti savaime. "
+        "Išjungti, perkrauti, atsijungti ar užmigdyti ranka galima bet kada — "
+        "ekranas taip pat gali gesti ir kompiuteris užsirakinti kaip įprastai."
+    )
+
+
+def keep_awake_unavailable(detail: str) -> str:
+    return f"Miego blokavimas šioje sistemoje neveikia ({detail}). Apdorojimas tęsiamas."
+
+
 def unknown_duration() -> str:
     return "trukmė nežinoma"
 
@@ -144,10 +156,19 @@ def log_statistics(luma_span: float, saturation: float) -> str:
     return f"Išmatuota iš kadrų: šviesumo diapazonas {luma_span:.3f}, sodrumas {saturation:.3f}"
 
 
+def log_suspected_not_applied(luma_span: float, saturation: float) -> str:
+    return (
+        f"ĮTARIAMA plokščia medžiaga (šviesumo diapazonas {luma_span:.3f}, sodrumas {saturation:.3f}), "
+        f"BET jokia transformacija netaikyta. Išmatuotas plokštumas rodo sceną, ne profilį: "
+        f"tamsus saulėlydis matuojasi taip pat kaip log. Jei tai tikrai log, nurodykite "
+        f"--convert-log on arba lange pasirinkite „visi failai yra log“."
+    )
+
+
 def log_thresholds(max_span: float, max_saturation: float) -> str:
     return (
-        f"Plokščio profilio ribos: diapazonas < {max_span:.2f} IR sodrumas < {max_saturation:.2f}. "
-        f"Tai pradinės, NEIŠMATUOTOS reikšmės — atsiųskite savo failų skaičius kalibravimui."
+        f"Įtarimo ribos: diapazonas < {max_span:.2f} IR sodrumas < {max_saturation:.2f}. "
+        f"Šios ribos NIEKO nekeičia — tik įrašo įtarimą į ataskaitą."
     )
 
 
@@ -162,11 +183,12 @@ def lut_applied(path: str) -> str:
     return f"Analizei pritaikytas LUT: {path}"
 
 
-def normalisation_applied() -> str:
+def normalisation_applied(strength: float, gain: float) -> str:
     return (
-        "Analizei pritaikytas procentilinis kontrasto ir sodrumo normalizavimas. "
-        "Tai APYTIKSLIS perskaičiavimas, o ne spalvų valdymo grandinė — "
-        "skaičiai nėra kolorimetriškai teisingi."
+        f"Pritaikytas procentilinis kontrasto ir sodrumo normalizavimas "
+        f"(stiprumas {strength:.2f}, sodrumo daugiklis {gain:.2f}). "
+        f"Tai APYTIKSLIS perskaičiavimas, o ne spalvų valdymo grandinė — "
+        f"skaičiai nėra kolorimetriškai teisingi. Tikram log naudokite LUT."
     )
 
 
@@ -360,6 +382,45 @@ def export_failed(timestamp: float, detail: str) -> str:
 # Ataskaita (report.html)
 # --------------------------------------------------------------------------
 
+def integrity_header() -> str:
+    return "Galutinis patikrinimas (ar viskas vietoje ir ar visos sąsajos veikia):"
+
+
+def integrity_ok(frames: int, files: int, previews: int) -> str:
+    return (
+        f"Viskas tvarkoje: ataskaitoje {frames} kadrų, diske rasti visi {files} failai, "
+        f"įterptos visos {previews} peržiūros."
+    )
+
+
+def integrity_missing_files(count: int, names: str) -> str:
+    return f"KLAIDA: pažymėta kaip išsaugota, bet failų diske nėra ({count}): {names}"
+
+
+def integrity_empty_files(count: int, names: str) -> str:
+    return f"KLAIDA: failai yra, bet tušti arba nenuskaitomi ({count}): {names}"
+
+
+def integrity_missing_previews(count: int, names: str) -> str:
+    return (
+        f"Ataskaitoje neįsikėlė peržiūros ({count}): {names}. Pats JPEG failas aplanke yra — "
+        f"nepavyko jo perskaityti peržiūrai."
+    )
+
+
+def integrity_failed_exports(count: int, names: str) -> str:
+    return f"Nepavyko išsaugoti kadrų ({count}): {names}"
+
+
+def integrity_orphans(count: int, names: str) -> str:
+    return f"Aplanke yra failų, kurių ataskaita nemini ({count}): {names}"
+
+
+def integrity_report_files(json_ok: bool, html_ok: bool) -> str:
+    return f"results.json: {'yra' if json_ok else 'NĖRA'}; report.html: {'yra' if html_ok else 'NĖRA'}"
+
+
+REPORT_INTEGRITY = "Galutinis patikrinimas"
 REPORT_TITLE = "Geriausių kadrų ataskaita"
 REPORT_GENERATED = "Sugeneruota"
 REPORT_CLIP = "Įrašas"

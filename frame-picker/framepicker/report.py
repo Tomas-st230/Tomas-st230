@@ -72,6 +72,103 @@ def write_results_json(results: dict, out_dir: str) -> str:
     return path
 
 
+def build_previews(results: dict, out_dir: str) -> dict[str, str]:
+    """Base64 previews for every exported frame, keyed by filename.
+
+    Built before the report is rendered so that a preview that could not be
+    produced is a *finding*, not an invisible gap in the page. Tomas's 77-file
+    run had exactly that: some frames rendered with no image and nothing said
+    so.
+    """
+    previews: dict[str, str] = {}
+    for clip in results.get("clips", []):
+        for frame in clip.get("frames", []):
+            name = frame.get("file")
+            if not name or name in previews:
+                continue
+            uri = _preview_data_uri(os.path.join(out_dir, name))
+            if uri:
+                previews[name] = uri
+    return previews
+
+
+def _referenced_files(results: dict) -> list[str]:
+    names: list[str] = []
+    for clip in results.get("clips", []):
+        for frame in clip.get("frames", []):
+            if frame.get("file"):
+                names.append(frame["file"])
+    return names
+
+
+def _names(items, limit: int = 6) -> str:
+    items = list(items)
+    head = ", ".join(items[:limit])
+    return head if len(items) <= limit else f"{head}, ..."
+
+
+def verify(results: dict, out_dir: str, previews: dict[str, str]) -> dict:
+    """Final check: does everything the report claims actually exist?
+
+    Requested directly: "at the very end, check that everything works and
+    everything has its links". Nothing here fixes anything - it measures, and
+    every discrepancy is named.
+    """
+    referenced = _referenced_files(results)
+    missing: list[str] = []
+    empty: list[str] = []
+    for name in referenced:
+        path = os.path.join(out_dir, name)
+        if not os.path.isfile(path):
+            missing.append(name)
+        elif os.path.getsize(path) == 0:
+            empty.append(name)
+
+    no_preview = [name for name in referenced if name not in previews]
+    failed_exports = [
+        os.path.basename(frame.get("file") or "?")
+        for clip in results.get("clips", [])
+        for frame in clip.get("frames", [])
+        if not frame.get("exported", True)
+    ]
+
+    try:
+        on_disk = {
+            entry for entry in os.listdir(out_dir)
+            if os.path.isfile(os.path.join(out_dir, entry))
+        }
+    except OSError:
+        on_disk = set()
+    orphans = sorted(on_disk - set(referenced) - {RESULTS_JSON, REPORT_HTML})
+
+    messages: list[str] = []
+    if missing:
+        messages.append(S.integrity_missing_files(len(missing), _names(missing)))
+    if empty:
+        messages.append(S.integrity_empty_files(len(empty), _names(empty)))
+    if failed_exports:
+        messages.append(S.integrity_failed_exports(len(failed_exports), _names(failed_exports)))
+    if no_preview:
+        messages.append(S.integrity_missing_previews(len(no_preview), _names(no_preview)))
+    if orphans:
+        messages.append(S.integrity_orphans(len(orphans), _names(orphans)))
+    if not messages:
+        messages.append(S.integrity_ok(len(referenced), len(referenced), len(previews)))
+
+    return {
+        "ok": not (missing or empty or failed_exports or no_preview),
+        "frames_referenced": len(referenced),
+        "files_present": len(referenced) - len(missing),
+        "files_missing": missing,
+        "files_empty": empty,
+        "previews_embedded": len(previews),
+        "previews_missing": no_preview,
+        "failed_exports": failed_exports,
+        "unreferenced_files": orphans,
+        "messages": messages,
+    }
+
+
 def _preview_data_uri(path: str, long_edge: int = PREVIEW_LONG_EDGE) -> str | None:
     """Base64 JPEG preview of *path*, or ``None`` if it cannot be read."""
     try:
@@ -138,10 +235,13 @@ def _meta_row(pairs: Iterable[tuple[str, str]]) -> str:
     return f'<div class="meta">{cells}</div>'
 
 
-def _shot_card(frame: dict, out_dir: str) -> str:
+def _shot_card(frame: dict, previews: dict[str, str]) -> str:
     file_name = frame.get("file") or ""
-    uri = _preview_data_uri(os.path.join(out_dir, file_name)) if file_name else None
-    img = f'<img src="{uri}" alt="{_esc(file_name)}">' if uri else ""
+    uri = previews.get(file_name)
+    img = (
+        f'<img src="{uri}" alt="{_esc(file_name)}">' if uri
+        else f'<div class="note bad" style="margin:0">{_esc(S.integrity_missing_previews(1, file_name))}</div>'
+    )
     reasons = "".join(f"<li>{_esc(r)}</li>" for r in frame.get("reasons", []))
     return (
         '<div class="shot">'
@@ -156,7 +256,7 @@ def _shot_card(frame: dict, out_dir: str) -> str:
     )
 
 
-def _clip_section(clip: dict, out_dir: str) -> str:
+def _clip_section(clip: dict, previews: dict[str, str]) -> str:
     probe = clip.get("probe", {})
     decode = clip.get("decode", {})
     rejects = clip.get("rejects", {})
@@ -192,17 +292,17 @@ def _clip_section(clip: dict, out_dir: str) -> str:
     if not frames:
         parts.append(_note(S.REPORT_NO_FRAMES, "bad"))
     else:
-        cards = "".join(_shot_card(frame, out_dir) for frame in frames)
+        cards = "".join(_shot_card(frame, previews) for frame in frames)
         parts.append(f'<div class="grid">{cards}</div>')
     parts.append("</div>")
     return "".join(parts)
 
 
-def _global_section(results: dict, out_dir: str) -> str:
+def _global_section(results: dict, previews: dict[str, str]) -> str:
     frames = results.get("global_top", [])
     if not frames:
         return ""
-    cards = "".join(_shot_card(frame, out_dir) for frame in frames)
+    cards = "".join(_shot_card(frame, previews) for frame in frames)
     return (
         f'<div class="card"><h2>{S.REPORT_GLOBAL}</h2>'
         f"{_note(S.REPORT_GLOBAL_NOTE, 'warn')}"
@@ -210,8 +310,10 @@ def _global_section(results: dict, out_dir: str) -> str:
     )
 
 
-def write_report_html(results: dict, out_dir: str) -> str:
+def write_report_html(results: dict, out_dir: str, previews: dict[str, str] | None = None) -> str:
     os.makedirs(out_dir, exist_ok=True)
+    if previews is None:
+        previews = build_previews(results, out_dir)
     generated = results.get("generated") or _dt.datetime.now().isoformat(timespec="seconds")
     summary = results.get("summary", {})
 
@@ -226,6 +328,12 @@ def write_report_html(results: dict, out_dir: str) -> str:
         head.append(_note(S.throughput(summary["throughput_s_per_footage_minute"])))
     for text in results.get("notes", []):
         head.append(_note(text))
+    integrity = results.get("integrity")
+    if integrity:
+        head.append(f"<h2>{S.REPORT_INTEGRITY}</h2>")
+        head.append(_note(S.integrity_header()))
+        for text in integrity.get("messages", []):
+            head.append(_note(text, "" if integrity.get("ok") else "bad"))
     weights = results.get("weights", {})
     weight_rows = "".join(f"<tr><td>{_esc(k)}</td><td>{v}</td></tr>" for k, v in weights.items())
     head.append(f"<h2>{S.REPORT_WEIGHTS}</h2><table>{weight_rows}</table>")
@@ -240,8 +348,8 @@ def write_report_html(results: dict, out_dir: str) -> str:
     head.append("</div>")
 
     body = "".join(head)
-    body += _global_section(results, out_dir)
-    body += "".join(_clip_section(clip, out_dir) for clip in results.get("clips", []))
+    body += _global_section(results, previews)
+    body += "".join(_clip_section(clip, previews) for clip in results.get("clips", []))
 
     document = (
         "<!doctype html>\n<html lang=\"lt\"><head><meta charset=\"utf-8\">"

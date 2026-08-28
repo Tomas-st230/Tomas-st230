@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, Sequence
 
-from . import decode, export, features, proc, report, scoring
+from . import decode, export, features, keepawake, proc, report, scoring
 from . import strings_lt as S
 from .probe import ProbeError, probe
 from .select import (
@@ -73,6 +73,7 @@ class Options:
     convert_log: str = "auto"
     lut: str | None = None
     lut_all: bool = False
+    normalise_strength: float = 1.0
     jobs: int = 0
     no_faces: bool = False
     face_model: str | None = None
@@ -96,6 +97,7 @@ class Options:
             "convert_log": self.convert_log,
             "lut": self.lut,
             "lut_all": self.lut_all,
+            "normalise_strength": self.normalise_strength,
             "jobs": self.jobs,
             "no_faces": self.no_faces,
             "image_format": self.image_format,
@@ -235,6 +237,10 @@ def analyse_clip(
         measured = S.log_statistics(stats["luma_span"], stats["saturation"])
         record["notes"].append(measured)
         messenger.say(measured)
+        if verdict.suspected and not verdict.is_log:
+            warning = S.log_suspected_not_applied(stats["luma_span"], stats["saturation"])
+            record["notes"].append(warning)
+            messenger.say(warning)
         thresholds = S.log_thresholds(
             decode.LOG_STATS_MAX_LUMA_SPAN, decode.LOG_STATS_MAX_SATURATION
         )
@@ -261,10 +267,13 @@ def analyse_clip(
                 _note(record, messenger, S.lut_forced_on_all())
         else:
             _note(record, messenger, S.lut_skipped_not_log())
-    if lut_path is None and verdict.is_log:
-        normalisation = decode.estimate_normalisation(samples) if samples else None
+    if lut_path is None and verdict.is_log and options.normalise_strength > 0:
+        normalisation = (
+            decode.estimate_normalisation(samples, options.normalise_strength) if samples else None
+        )
         if normalisation is not None:
-            _note(record, messenger, S.normalisation_applied())
+            _note(record, messenger, S.normalisation_applied(
+                normalisation.strength, normalisation.saturation_gain))
     if lut_path is None and normalisation is None:
         record["notes"].append(S.no_conversion_applied())
     record["color"] = {
@@ -624,12 +633,17 @@ def run_batch(
                 on_clip_done(clip_summary(index, path, None, detail))
 
     jobs = options.jobs if options.jobs and options.jobs > 0 else min(4, os.cpu_count() or 1)
-    if jobs == 1:
-        for index, path in enumerate(paths):
-            work(index, path)
-    else:
-        with ThreadPoolExecutor(max_workers=jobs) as pool:
-            list(pool.map(lambda pair: work(*pair), list(enumerate(paths))))
+    with keepawake.keep_awake() as awake:
+        if awake.active:
+            messenger.say(S.keep_awake_on())
+        elif awake.detail and sys.platform == "win32":
+            messenger.say(S.keep_awake_unavailable(awake.detail))
+        if jobs == 1:
+            for index, path in enumerate(paths):
+                work(index, path)
+        else:
+            with ThreadPoolExecutor(max_workers=jobs) as pool:
+                list(pool.map(lambda pair: work(*pair), list(enumerate(paths))))
 
     done = [c for c in clips if c is not None]
     elapsed = time.perf_counter() - started
@@ -657,6 +671,7 @@ def run_batch(
             "wall_clock_seconds": elapsed,
             "throughput_s_per_footage_minute": (elapsed / (footage_seconds / 60.0)) if footage_seconds > 0 else None,
         },
+        "keep_awake": awake.as_dict(),
         "notes": list(messenger.notes),
         "clips": done,
         "skipped": skipped,
@@ -669,10 +684,25 @@ def run_batch(
         messenger.say(S.cancelled_cleanup(options.out_dir))
         return BatchResult(results, options.out_dir, cancelled=True, messages=messenger.log)
 
+    # Build every preview first, so a preview that cannot be produced becomes a
+    # named finding instead of a silent gap in the page, then check the whole
+    # output before writing anything final.
+    previews = report.build_previews(results, options.out_dir)
+    results["integrity"] = report.verify(results, options.out_dir, previews)
+    for text in results["integrity"]["messages"]:
+        messenger.say(text)
+
     json_path = report.write_results_json(results, options.out_dir)
     created.add(json_path)
-    html_path = report.write_report_html(results, options.out_dir)
+    html_path = report.write_report_html(results, options.out_dir, previews)
     created.add(html_path)
+    results["integrity"]["report_files"] = S.integrity_report_files(
+        os.path.isfile(json_path) and os.path.getsize(json_path) > 0,
+        os.path.isfile(html_path) and os.path.getsize(html_path) > 0,
+    )
+    messenger.say(results["integrity"]["report_files"])
+    # results.json is rewritten so it carries the check on the report files too.
+    report.write_results_json(results, options.out_dir)
 
     if options.select_mode == MODE_THRESHOLD:
         messenger.say(S.batch_summary_threshold(
@@ -742,6 +772,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="path to a .cube LUT, applied only to clips detected as log")
     parser.add_argument("--lut-all", action="store_true",
                         help="apply --lut to every clip, log or not (wrecks Rec.709 footage)")
+    parser.add_argument("--normalise-strength", type=float, default=1.0,
+                        help="strength of the no-LUT log fallback, 0 = off, 1 = full")
     parser.add_argument("--jobs", type=int, default=0, help="files processed in parallel (0 = auto)")
     parser.add_argument("--no-faces", action="store_true", help="skip face detection entirely")
     parser.add_argument("--face-model", default=None, help="explicit path to a YuNet .onnx model")
@@ -770,6 +802,7 @@ def options_from_args(args: argparse.Namespace) -> Options:
         convert_log=args.convert_log,
         lut=args.lut,
         lut_all=args.lut_all,
+        normalise_strength=args.normalise_strength,
         jobs=args.jobs,
         no_faces=args.no_faces,
         face_model=args.face_model,

@@ -33,13 +33,18 @@ LOG_FILENAME_HINTS = (
 #: Colour transfer characteristics that mean "not a normal display gamma".
 LOG_TRANSFER_TAGS = ("arib-std-b67", "smpte2084", "log100", "log316", "bt1361e")
 
-#: Measured flatness limits below which a clip is treated as log.
-#: Both must hold. DJI does not put the picture profile in the filename and
-#: often does not tag the colour transfer either, so measuring the frames is
-#: the only signal left. These two numbers are STARTING VALUES separating
-#: synthetic fixtures (flat: 0.17 / 0.19, normal: 0.73-0.81 / 0.73-0.95); they
-#: have never been checked against real D-Log M footage, and every run writes
-#: the measured values into results.json so they can be calibrated.
+#: Flatness limits below which a clip is *suspected* of being log.
+#:
+#: These do NOT trigger a colour transform, and that is deliberate. Measured
+#: on 77 real DJI clips from one card, luma_span ran 0.155-0.925 and mean
+#: saturation 0.074-0.765 in one continuous distribution with no bimodal gap:
+#: every file was the same picture profile, so the measurement was reading the
+#: *scene*, not the profile. Four dark sunset clips fell under these limits and
+#: had their saturation multiplied by 2.5, which wrecked the exported stills.
+#:
+#: So flatness is now evidence to report, not a reason to act. A transform
+#: happens only on the --convert-log flag, a log colour-transfer tag, or a
+#: filename hint.
 LOG_STATS_MAX_LUMA_SPAN = 0.55
 LOG_STATS_MAX_SATURATION = 0.22
 
@@ -55,15 +60,17 @@ class DecodeError(RuntimeError):
 
 @dataclass
 class LogVerdict:
-    is_log: bool
+    is_log: bool         # true only on evidence strong enough to act on
     source: str          # flag | metadata | filename | statistics | default
     detail: str          # what exactly was seen
     is_a_guess: bool
     statistics: dict | None = None
+    suspected: bool = False   # measured as flat, but not acted upon
 
     def as_dict(self) -> dict:
         return {
             "is_log": self.is_log,
+            "suspected_flat": self.suspected,
             "source": self.source,
             "detail": self.detail,
             "is_a_guess": self.is_a_guess,
@@ -132,7 +139,9 @@ def detect_log(clip: ClipInfo, flag: str = "auto", stats: dict | None = None) ->
             and stats["saturation"] < LOG_STATS_MAX_SATURATION
         )
         detail = f"luma_span={stats['luma_span']:.3f}, saturation={stats['saturation']:.3f}"
-        return LogVerdict(flat, "statistics", detail, is_a_guess=True, statistics=stats)
+        # is_log stays False: a flat *scene* is not a flat *profile*, and acting
+        # on the difference destroyed real exports. See the constants above.
+        return LogVerdict(False, "statistics", detail, is_a_guess=True, statistics=stats, suspected=flat)
 
     return LogVerdict(False, "default", "no log evidence", is_a_guess=True, statistics=stats)
 
@@ -140,6 +149,10 @@ def detect_log(clip: ClipInfo, flag: str = "auto", stats: dict | None = None) ->
 # --------------------------------------------------------------------------
 # Colour transform used for analysis
 # --------------------------------------------------------------------------
+
+
+#: How much of the normalisation to apply, 0 = none, 1 = full.
+NORMALISE_DEFAULT_STRENGTH = 1.0
 
 
 @dataclass
@@ -154,33 +167,56 @@ class Normalisation:
     lo: float
     hi: float
     saturation_gain: float
+    strength: float = NORMALISE_DEFAULT_STRENGTH
 
     def as_dict(self) -> dict:
-        return {"luma_low": self.lo, "luma_high": self.hi, "saturation_gain": self.saturation_gain}
+        return {
+            "luma_low": self.lo,
+            "luma_high": self.hi,
+            "saturation_gain": self.saturation_gain,
+            "strength": self.strength,
+        }
 
     def apply(self, frame: np.ndarray) -> np.ndarray:
         import cv2
 
+        strength = _clamp(self.strength, 0.0, 1.0)
+        if strength <= 0.0:
+            return frame
         span = max(self.hi - self.lo, 1e-3)
         work = frame.astype(np.float32)
         work = (work - self.lo) * (255.0 / span)
         np.clip(work, 0, 255, out=work)
-        if abs(self.saturation_gain - 1.0) > 1e-3:
+        gain = 1.0 + (self.saturation_gain - 1.0) * strength
+        if abs(gain - 1.0) > 1e-3:
             hsv = cv2.cvtColor(work.astype(np.uint8), cv2.COLOR_RGB2HSV).astype(np.float32)
-            hsv[:, :, 1] *= self.saturation_gain
+            hsv[:, :, 1] *= gain
             np.clip(hsv[:, :, 1], 0, 255, out=hsv[:, :, 1])
-            return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
-        return work.astype(np.uint8)
+            work = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB).astype(np.float32)
+        # Blend back toward the original so the transform can be dialled down
+        # instead of being all-or-nothing.
+        if strength < 1.0:
+            work = frame.astype(np.float32) * (1.0 - strength) + work * strength
+        return np.clip(work, 0, 255).astype(np.uint8)
 
 
 #: Target mean saturation after normalising a log clip (0-255 scale).
 NORMALISE_TARGET_SATURATION = 90.0
-NORMALISE_MAX_GAIN = 2.5
+#: Hard cap on the saturation multiplier. Was 2.5, which on a dark sunset
+#: produced the neon output that made this limit necessary. A real log-to-
+#: display conversion is a LUT; this is a fallback and must stay timid.
+NORMALISE_MAX_GAIN = 1.6
 NORMALISE_LOW_PERCENTILE = 1.0
 NORMALISE_HIGH_PERCENTILE = 99.0
 
 
-def estimate_normalisation(samples: Sequence[np.ndarray]) -> Normalisation | None:
+def _clamp(value: float, low: float, high: float) -> float:
+    return low if value < low else (high if value > high else float(value))
+
+
+def estimate_normalisation(
+    samples: Sequence[np.ndarray], strength: float = NORMALISE_DEFAULT_STRENGTH
+) -> Normalisation | None:
     """Derive one contrast/saturation stretch from a handful of sample frames."""
     import cv2
 
@@ -200,7 +236,7 @@ def estimate_normalisation(samples: Sequence[np.ndarray]) -> Normalisation | Non
         sat_means.append(float(hsv[:, :, 1].mean()))
     mean_sat = max(sum(sat_means) / len(sat_means), 1.0)
     gain = min(NORMALISE_MAX_GAIN, max(1.0, NORMALISE_TARGET_SATURATION / mean_sat))
-    return Normalisation(lo=lo, hi=hi, saturation_gain=gain)
+    return Normalisation(lo=lo, hi=hi, saturation_gain=gain, strength=strength)
 
 
 # --------------------------------------------------------------------------
