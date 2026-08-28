@@ -93,3 +93,27 @@ def test_a_log_clip_and_a_normal_clip_are_labelled_differently(window, tmp_path)
     assert window._table.item(0, 2).text() == S.GUI_COLOR_LUT
     assert window._table.item(1, 1).text() == S.GUI_LOG_NO
     assert window._table.item(1, 2).text() == S.GUI_COLOR_NONE
+
+
+def test_a_dropped_folder_becomes_one_row_per_file(window, tmp_path):
+    """The table rows must be exactly the files the pipeline will process.
+
+    A folder shown as a single row while run_batch processed twenty files left
+    nineteen results with nowhere to land.
+    """
+    import os
+
+    folder = tmp_path / "card"
+    folder.mkdir()
+    for name, mtime in (("DJI_0003.MP4", 3000), ("DJI_0001.MP4", 1000), ("DJI_0002.MP4", 2000)):
+        path = folder / name
+        path.write_bytes(b"x")
+        os.utime(path, (mtime, mtime))
+    (folder / "readme.txt").write_bytes(b"x")
+
+    window._set_paths([str(folder)])
+    assert window._table.rowCount() == 3
+    listed = [window._table.item(row, 0).text() for row in range(3)]
+    assert listed == ["DJI_0001.MP4", "DJI_0002.MP4", "DJI_0003.MP4"], "oldest first"
+    assert len(window.options().paths) == 3
+    assert window._progress.maximum() == 3

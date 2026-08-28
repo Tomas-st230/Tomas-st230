@@ -132,6 +132,15 @@ python -m framepicker "D:\video\*.MP4" --out D:\pickai
 An input that matches nothing is named in the console and listed in
 `results.json` under `skipped`; it is never silently dropped.
 
+Files are processed **oldest first**, by the file's modification time — which is
+recording order for a card copied off a camera, and stays right when the frame
+counter has rolled over or two cards are mixed. Ties break on filename so the
+order is stable between runs. `--order name` sorts by filename instead, and
+`--order none` keeps the order the arguments were given in. `results.json`
+records which order was used, and `probe.extra.format_tags` carries the
+container's own `creation_time` for every clip, so if a card copy lost its
+timestamps you can see that rather than wonder.
+
 | Flag | Default | Meaning |
 |---|---|---|
 | `--out` | `frame-picker-out` | output directory |
@@ -153,6 +162,7 @@ An input that matches nothing is named in the console and listed in
 | `--global-top` | `20` | frames on the "best of the whole batch" section (`0` turns it off) |
 | `--max-candidates` | `3000` | upper bound on analysis frames buffered per clip |
 | `--hwaccel` | `auto` | `auto` tries CUDA, `none` forces CPU |
+| `--order` | `date` | processing order: `date` = oldest file first, `name` = by filename, `none` = as given |
 
 GUI — a wrapper around the same functions. There is no second code path, and
 `gui/` holds no logic: it collects paths and settings, hands them to
@@ -164,7 +174,9 @@ python -m gui.drop_window
 
 One window:
 
-* a drop area (files or whole folders; double-click opens a file dialog)
+* a drop area (files or whole folders; double-click opens a file dialog). A
+  dropped folder is expanded immediately, so the table shows one row per file
+  in the order they will be processed
 * a settings block — the drone LUT with a file picker and the "apply to every
   file" override, the log-detection mode, the quality threshold, the per-clip
   bound, and the output folder

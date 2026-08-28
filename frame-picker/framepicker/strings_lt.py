@@ -100,6 +100,14 @@ def input_not_found(path: str) -> str:
     return f"Pagal nurodymą nerasta nė vieno vaizdo failo: {path}"
 
 
+def ordered_by_date() -> str:
+    return "Failai apdorojami nuo seniausio iki naujausio (pagal failo datą diske)"
+
+
+def ordered_by_name() -> str:
+    return "Failai apdorojami pagal pavadinimą"
+
+
 def inputs_expanded(given: int, found: int) -> str:
     return f"Nurodyta įvesčių: {given}; rasta vaizdo failų: {found}"
 

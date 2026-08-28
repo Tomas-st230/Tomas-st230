@@ -341,3 +341,51 @@ def test_container_tags_are_kept_so_the_camera_can_be_identified(normal_clip):
     clip = probe(normal_clip)
     assert "format_tags" in clip.extra
     assert isinstance(clip.extra["format_tags"], dict)
+
+
+def test_expand_inputs_orders_oldest_first(tmp_path):
+    """A card copied off a camera is processed in recording order."""
+    import time
+
+    from framepicker.cli import ORDER_DATE, ORDER_NAME, ORDER_NONE, expand_inputs
+
+    # Deliberately reverse-alphabetical against the timestamps, so a name sort
+    # and a date sort cannot accidentally agree.
+    for name, mtime in (("c_first.mp4", 1000), ("b_second.mp4", 2000), ("a_third.mp4", 3000)):
+        path = tmp_path / name
+        path.write_bytes(b"x")
+        os.utime(path, (mtime, mtime))
+    del time
+
+    by_date, _ = expand_inputs([str(tmp_path)], ORDER_DATE)
+    assert [os.path.basename(p) for p in by_date] == ["c_first.mp4", "b_second.mp4", "a_third.mp4"]
+
+    by_name, _ = expand_inputs([str(tmp_path)], ORDER_NAME)
+    assert [os.path.basename(p) for p in by_name] == ["a_third.mp4", "b_second.mp4", "c_first.mp4"]
+
+    given = [str(tmp_path / "b_second.mp4"), str(tmp_path / "a_third.mp4")]
+    as_given, _ = expand_inputs(given, ORDER_NONE)
+    assert as_given == given
+
+
+def test_date_order_is_stable_for_identical_timestamps(tmp_path):
+    from framepicker.cli import ORDER_DATE, expand_inputs
+
+    for name in ("b.mp4", "a.mp4", "c.mp4"):
+        path = tmp_path / name
+        path.write_bytes(b"x")
+        os.utime(path, (5000, 5000))
+    files, _ = expand_inputs([str(tmp_path)], ORDER_DATE)
+    assert [os.path.basename(p) for p in files] == ["a.mp4", "b.mp4", "c.mp4"]
+
+
+@requires_ffmpeg
+def test_clips_are_reported_in_processing_order(normal_clip, blurred_clip, tmp_path):
+    import os as _os
+
+    _os.utime(blurred_clip, (1_600_000_000, 1_600_000_000))
+    _os.utime(normal_clip, (1_700_000_000, 1_700_000_000))
+    result = _run([blurred_clip, normal_clip], tmp_path, min_score=0.0, min_gap=1.0, jobs=1)
+    names = [c["probe"]["name"] for c in result.results["clips"]]
+    assert names == [os.path.basename(blurred_clip), os.path.basename(normal_clip)]
+    assert result.results["options"]["order"] == "date"

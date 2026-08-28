@@ -46,6 +46,11 @@ DEFAULT_MIN_GAP = 2.0
 #: rate is lowered and the report says so, instead of the tool quietly eating
 #: all the memory on a long file.
 DEFAULT_MAX_CANDIDATES = 3000
+#: Processing order of the expanded file list.
+ORDER_DATE = "date"      # oldest first, by the file's modification time
+ORDER_NAME = "name"
+ORDER_NONE = "none"      # exactly as given on the command line
+
 #: Extensions treated as video when a folder or a wildcard is given. Lives
 #: here, not in the GUI: expanding an input into a file list is logic.
 VIDEO_SUFFIXES = (
@@ -76,6 +81,7 @@ class Options:
     global_top: int = DEFAULT_GLOBAL_TOP
     max_candidates: int = DEFAULT_MAX_CANDIDATES
     hwaccel: str = "auto"
+    order: str = ORDER_DATE
     select_mode: str = MODE_THRESHOLD
     min_score: float = DEFAULT_MIN_SCORE
     max_per_clip: int = DEFAULT_MAX_PER_CLIP
@@ -97,6 +103,7 @@ class Options:
             "global_top": self.global_top,
             "max_candidates": self.max_candidates,
             "hwaccel": self.hwaccel,
+            "order": self.order,
             "select_mode": self.select_mode,
             "min_score": self.min_score,
             "max_per_clip": self.max_per_clip,
@@ -474,13 +481,25 @@ def _log_source_text(source: str) -> str:
 # --------------------------------------------------------------------------
 
 
-def expand_inputs(paths: Sequence[str]) -> tuple[list[str], list[str]]:
-    """Turn CLI arguments into a concrete file list.
+def _mtime(path: str) -> float:
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0.0
+
+
+def expand_inputs(paths: Sequence[str], order: str = ORDER_DATE) -> tuple[list[str], list[str]]:
+    """Turn CLI arguments into a concrete, ordered file list.
 
     A folder becomes every video file in it, and a wildcard is expanded here
     rather than by the shell - ``cmd`` and PowerShell do not glob arguments
     for a Python program, so ``*.MP4`` would otherwise arrive verbatim and
     match nothing.
+
+    The whole result is then ordered: ``ORDER_DATE`` (default) puts the oldest
+    file first by its modification time, which is the recording order for a
+    card copied off a camera; ``ORDER_NAME`` sorts by filename; ``ORDER_NONE``
+    keeps the order the arguments were given in.
 
     Returns ``(files, unmatched)``; nothing is dropped silently.
     """
@@ -511,6 +530,13 @@ def expand_inputs(paths: Sequence[str]) -> tuple[list[str], list[str]]:
         if key not in seen:
             seen.add(key)
             unique.append(path)
+
+    if order == ORDER_DATE:
+        # Name as the tie-break, so two files written in the same second keep
+        # a stable order instead of shuffling between runs.
+        unique.sort(key=lambda p: (_mtime(p), os.path.basename(p).lower()))
+    elif order == ORDER_NAME:
+        unique.sort(key=lambda p: os.path.basename(p).lower())
     return unique, unmatched
 
 
@@ -555,11 +581,16 @@ def run_batch(
             messenger.say(S.ffmpeg_missing(tool))
             return BatchResult({}, options.out_dir, messages=messenger.log)
 
-    paths, unmatched = expand_inputs(options.paths)
+    paths, unmatched = expand_inputs(options.paths, options.order)
     for missing in unmatched:
         messenger.say(S.input_not_found(missing))
     if len(paths) != len(options.paths):
         messenger.say(S.inputs_expanded(len(options.paths), len(paths)))
+    if len(paths) > 1:
+        if options.order == ORDER_DATE:
+            messenger.say(S.ordered_by_date())
+        elif options.order == ORDER_NAME:
+            messenger.say(S.ordered_by_name())
     if not paths:
         messenger.say(S.no_input_files())
         return BatchResult({}, options.out_dir, messages=messenger.log)
@@ -722,6 +753,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-candidates", type=int, default=DEFAULT_MAX_CANDIDATES,
                         help="upper bound on analysis frames buffered per clip")
     parser.add_argument("--hwaccel", default="auto", help="hardware decoder to try ('auto', 'cuda', 'none')")
+    parser.add_argument("--order", choices=(ORDER_DATE, ORDER_NAME, ORDER_NONE), default=ORDER_DATE,
+                        help="processing order: 'date' = oldest file first (default), "
+                             "'name' = by filename, 'none' = as given")
     parser.add_argument("--version", action="version", version=f"frame-picker {VERSION}")
     return parser
 
@@ -744,6 +778,7 @@ def options_from_args(args: argparse.Namespace) -> Options:
         global_top=args.global_top,
         max_candidates=args.max_candidates,
         hwaccel=args.hwaccel,
+        order=args.order,
         select_mode=args.select_mode,
         min_score=args.min_score,
         max_per_clip=args.max_per_clip,

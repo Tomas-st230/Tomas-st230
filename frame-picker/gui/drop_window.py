@@ -43,8 +43,10 @@ from framepicker.cli import (
     DEFAULT_MAX_PER_CLIP,
     DEFAULT_MIN_SCORE,
     DEFAULT_OUT_DIR,
+    ORDER_DATE,
     VIDEO_SUFFIXES,
     Options,
+    expand_inputs,
     run_batch,
 )
 
@@ -101,6 +103,7 @@ class DropWindow(QWidget):
         self.resize(920, 620)
 
         self._initial_out_dir = os.path.abspath(out_dir)
+        self._order = ORDER_DATE
         self._paths: list[str] = []
         self._cancel = threading.Event()
         self._thread: QThread | None = None
@@ -215,8 +218,6 @@ class DropWindow(QWidget):
 
     def dropEvent(self, event) -> None:  # noqa: N802 - Qt naming
         dropped = [url.toLocalFile() for url in event.mimeData().urls()]
-        # Folders are passed straight through: framepicker.cli expands them,
-        # and deciding what counts as a video file is not the GUI's job.
         self._set_paths(self._paths + [p for p in dropped if os.path.isdir(p) or self._is_video(p)])
         event.acceptProposedAction()
 
@@ -230,14 +231,14 @@ class DropWindow(QWidget):
         return path.lower().endswith(VIDEO_SUFFIXES)
 
     def _set_paths(self, paths: list[str]) -> None:
-        seen: set[str] = set()
-        unique = []
-        for path in paths:
-            key = os.path.normcase(os.path.abspath(path))
-            if key not in seen:
-                seen.add(key)
-                unique.append(path)
+        # Expand here, with framepicker's own function, so the table rows are
+        # exactly the files run_batch will process in exactly its order. A
+        # dropped folder that showed as one row while the pipeline processed
+        # twenty files meant nineteen results had nowhere to land.
+        unique, unmatched = expand_inputs(paths, self._order)
         self._paths = unique
+        if unmatched:
+            self._status.setText(S.input_not_found(unmatched[0]))
         self._table.setRowCount(len(unique))
         for row, path in enumerate(unique):
             self._set_cell(row, 0, os.path.basename(path))
@@ -273,6 +274,7 @@ class DropWindow(QWidget):
             convert_log=PROFILE_CHOICES[self._profile.currentIndex()][1],
             min_score=self._min_score.value(),
             max_per_clip=self._max_per_clip.value(),
+            order=self._order,
         )
 
     # -- run ---------------------------------------------------------------
