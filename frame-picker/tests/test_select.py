@@ -55,3 +55,82 @@ def test_selection_is_returned_in_rank_order():
     result = select(items, per_clip=4, min_gap=2.0, clip_duration=60.0)
     scores = [c.score for c in result.selected]
     assert scores == sorted(scores, reverse=True)
+
+
+# --------------------------------------------------------------------------
+# The threshold decides how many, not a cap
+# --------------------------------------------------------------------------
+
+
+def _spread(count: int, score: float = 0.8, step: float = 10.0) -> list[Candidate]:
+    """Candidates far apart in time and visually unlike each other."""
+    return [
+        _candidate(i, i * step, score, dhash=(0x0F0F0F0F0F0F0F0F * (i + 1)) & ((1 << 64) - 1))
+        for i in range(count)
+    ]
+
+
+def test_by_default_nothing_caps_a_strong_clip():
+    """A clip full of good frames returns all of them, not the first twelve."""
+    from framepicker.select import DEFAULT_MAX_PER_CLIP, MODE_THRESHOLD
+
+    assert DEFAULT_MAX_PER_CLIP == 0, "a cap must not be the default"
+    candidates = _spread(30)
+    result = select(candidates, per_clip=6, mode=MODE_THRESHOLD, min_score=0.6,
+                    min_gap=2.0, clip_duration=60.0)
+    assert len(result.selected) == 30
+    assert result.capped is False
+
+
+def test_one_good_frame_out_of_many_is_a_complete_answer():
+    """Most of the clip below the bar, one frame above it: one frame is right."""
+    from framepicker.select import MODE_THRESHOLD
+
+    candidates = _spread(200, score=0.42)
+    candidates[137] = _candidate(137, 1370.0, 0.71, dhash=0xAAAA5555AAAA5555)
+    result = select(candidates, per_clip=6, mode=MODE_THRESHOLD, min_score=0.6,
+                    min_gap=2.0, clip_duration=2000.0)
+
+    assert [c.index for c in result.selected] == [137]
+    assert result.passed_threshold == 1
+    assert result.rejected_below_threshold == 199
+    assert result.shortfall == 0, "threshold mode has no target to fall short of"
+
+
+def test_nothing_good_enough_returns_nothing_and_names_the_best_score():
+    from framepicker import strings_lt as S
+    from framepicker.select import MODE_THRESHOLD
+
+    result = select(_spread(12, score=0.41), per_clip=6, mode=MODE_THRESHOLD,
+                    min_score=0.6, min_gap=2.0, clip_duration=120.0)
+    assert result.selected == []
+    assert result.best_score == 0.41
+    assert S.threshold_none_passed(0.41, 0.6) in result.notes
+
+
+def test_a_cap_is_available_and_says_it_was_the_cap():
+    from framepicker import strings_lt as S
+    from framepicker.select import MODE_THRESHOLD
+
+    result = select(_spread(30), per_clip=6, mode=MODE_THRESHOLD, min_score=0.6,
+                    max_per_clip=4, min_gap=2.0, clip_duration=60.0)
+    assert len(result.selected) == 4
+    assert result.capped is True
+    assert S.threshold_capped(4) in result.notes
+
+
+def test_the_gap_and_the_duplicate_test_still_apply_without_a_cap():
+    """"No bound" is not "everything": the same picture twice is still rejected."""
+    from framepicker.select import MODE_THRESHOLD
+
+    shared = np.zeros(8 ** 3)
+    shared[9] = 1.0
+    twins = [
+        Candidate(index=i, t=i * 30.0, score=0.9, dhash=0x1234123412341234, histogram=shared)
+        for i in range(5)
+    ]
+    result = select(twins, per_clip=6, mode=MODE_THRESHOLD, min_score=0.6,
+                    min_gap=2.0, clip_duration=300.0)
+    assert len(result.selected) == 1
+    assert result.rejected_duplicate == 4
+    assert result.capped is False

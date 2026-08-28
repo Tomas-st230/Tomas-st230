@@ -992,9 +992,10 @@ def build_parser() -> argparse.ArgumentParser:
                              "'count' aims at --per-clip and reports any shortfall")
     parser.add_argument("--min-score", type=float, default=DEFAULT_MIN_SCORE,
                         help="score a frame must reach in threshold mode "
-                             "(starting value, not calibrated)")
+                             "(0.60: chosen after a 163-file run, not a measured constant)")
     parser.add_argument("--max-per-clip", type=int, default=DEFAULT_MAX_PER_CLIP,
-                        help="upper bound on frames per clip in threshold mode (0 = no bound)")
+                        help="upper bound on frames per clip in threshold mode "
+                             "(0 = no bound, the default: the threshold decides how many)")
     parser.add_argument("--export-height", type=int, default=0,
                         help="scale exported stills down to this height "
                              "(e.g. 1080); 0 keeps the source resolution")

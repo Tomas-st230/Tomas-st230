@@ -720,3 +720,23 @@ def test_the_side_file_sizes_are_measured_after_everything_is_written(normal_cli
         assert side[name] and side[name] > 0, (name, side)
     on_disk = json.load(open(os.path.join(result.out_dir, report.RESULTS_JSON), encoding="utf-8"))
     assert on_disk["integrity"]["side_files"][report.RESULTS_JSON] > 0
+
+
+@requires_ffmpeg
+def test_the_shipped_defaults_are_threshold_060_and_no_cap(normal_clip, tmp_path):
+    """What Tomas actually runs with, locked down so it cannot drift back."""
+    from framepicker.cli import Options
+    from framepicker.select import DEFAULT_MAX_PER_CLIP, DEFAULT_MIN_SCORE
+
+    assert (DEFAULT_MIN_SCORE, DEFAULT_MAX_PER_CLIP) == (0.60, 0)
+    defaults = Options()
+    assert defaults.min_score == 0.60
+    assert defaults.max_per_clip == 0
+    assert defaults.select_mode == MODE_THRESHOLD
+
+    result = run_batch(Options(paths=[normal_clip], out_dir=str(tmp_path / "out"),
+                              min_score=0.0, min_gap=1.0))
+    selection = result.results["clips"][0]["selection"]
+    assert selection["capped"] is False, "nothing may cap a run at the defaults"
+    assert selection["delivered"] == selection["passed_threshold"] - (
+        selection["rejected_time_gap"] + selection["rejected_duplicate"])

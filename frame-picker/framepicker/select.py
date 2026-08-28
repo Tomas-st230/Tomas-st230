@@ -28,15 +28,27 @@ GAP_CLIP_FRACTION = 0.03
 MODE_THRESHOLD = "threshold"
 MODE_COUNT = "count"
 
-#: Score a frame has to reach in threshold mode. Like WEIGHTS, this is a
-#: starting value chosen by argument, not by measurement: it means nothing
-#: until the weights are calibrated on real footage, and everything that
-#: prints it says so.
-DEFAULT_MIN_SCORE = 0.65
+#: Score a frame has to reach in threshold mode.
+#:
+#: 0.60 rather than the 0.65 this started with: Tomas ran 163 files of his own
+#: footage at 0.60 and kept the result, which is the only kind of evidence this
+#: number can have. It is still one person's judgement on one card, not a
+#: measured constant, and everything that prints it says so.
+DEFAULT_MIN_SCORE = 0.60
 
-#: Safety bound in threshold mode, so a long clip cannot quietly export a
-#: hundred stills. 0 means no bound.
-DEFAULT_MAX_PER_CLIP = 12
+#: Upper bound on frames per clip in threshold mode. **0 by default: no bound.**
+#:
+#: A cap and a threshold are two different questions, and only the threshold is
+#: the right one here. A cap answers "how many do I want", which nobody knows
+#: before looking: one clip is worth a single frame out of thousands, the next
+#: is worth fifteen. The threshold answers "is this frame good enough", which is
+#: the same question for every clip. Capping on top of a threshold throws away
+#: frames that already passed the bar - and does it silently, in the sense that
+#: the report says "capped" without saying what was lost.
+#:
+#: Set it to a number if a runaway clip ever needs one; the run will then say
+#: that the cap, not the quality, decided.
+DEFAULT_MAX_PER_CLIP = 0
 
 
 @dataclass
@@ -128,9 +140,11 @@ def select(
     """Pick frames, and explain both what was taken and what was not.
 
     ``MODE_COUNT`` aims at *per_clip* frames and reports any shortfall.
-    ``MODE_THRESHOLD`` takes every frame scoring at least *min_score* - two
-    from a weak clip, twelve from a strong one - bounded by *max_per_clip*
-    so a long file cannot silently export a hundred stills.
+    ``MODE_THRESHOLD`` takes every frame scoring at least *min_score* - none
+    from a weak clip, one from a long dull one, fifteen from a strong one.
+    *max_per_clip* bounds that if asked to (0 = no bound, the default); the
+    time gap and the duplicate test still apply either way, so "no bound" is
+    not the same as "everything".
     """
     gap = effective_gap(min_gap, clip_duration)
     ordered = sorted(candidates, key=lambda c: (-c.score, c.t))

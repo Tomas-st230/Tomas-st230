@@ -186,7 +186,7 @@ The whole folder, the drone LUT, the look chosen per clip, oldest file first:
 ```powershell
 python -m framepicker "D:\tomas\Videos\DJI Drone foot" `
   --lut "D:\LUT\DJI Lito X1 D-Log M to Rec.709 LUT.cube" `
-  --look auto --min-score 0.65
+  --look auto --min-score 0.60
 ```
 
 `--out` defaults to `frame-picker-out` inside `D:\tomas\Videos\DJI Drone foot`
@@ -221,8 +221,8 @@ timestamps you can see that rather than wonder.
 | `--out` | `frame-picker-out`, or `D:\tomas\Videos\DJI Drone foot\frame-picker-out` when that folder exists | output directory; **every run gets its own dated subfolder inside it** |
 | `--no-run-folder` | off | write straight into `--out` instead of a per-run subfolder |
 | `--select` | `threshold` | `threshold` keeps every frame above `--min-score`; `count` aims at `--per-clip` |
-| `--min-score` | `0.65` | score a frame has to reach in threshold mode — **an uncalibrated starting value** |
-| `--max-per-clip` | `12` | upper bound per clip in threshold mode (`0` = no bound) |
+| `--min-score` | `0.60` | score a frame has to reach in threshold mode — chosen after a 163-file run, not a measured constant |
+| `--max-per-clip` | `0` | upper bound per clip in threshold mode; **0 = no bound, the default** |
 | `--per-clip` | `6` | target frames per clip, **count mode only** |
 | `--export-height` | `0` | scale exported stills down to this height (e.g. `1080`); `0` keeps the source resolution |
 | `--fps` | `2` | analysis sampling rate |
@@ -677,17 +677,29 @@ in the same confident format as a real one.
 
 ### Selection
 
-Two modes. **Threshold is the default**: every frame scoring at least
-`--min-score` is taken, so a weak clip can return two frames and a strong one
-twelve. `--max-per-clip 12` bounds it so a long file cannot quietly export a
-hundred stills; `--max-per-clip 0` removes the bound.
+Two modes. **Threshold is the default, and nothing caps it**: every frame
+scoring at least `--min-score` is taken. A dull ten-minute clip can return one
+frame, or none; a strong one can return fifteen.
 
-`--min-score 0.65` is **a starting value chosen by argument, not by
-measurement** — the same status as the weights, and it means little until the
-weights are calibrated. Every run prints the threshold with that warning
-attached. When no frame in a clip reaches it, the tool says so, names the best
-score it did see, and tells you to lower the bar; it does not quietly write an
-empty folder.
+There is no per-clip cap by default (`--max-per-clip 0`) on purpose. A cap and
+a threshold answer two different questions, and only the threshold is the right
+one here: "how many do I want from this clip" is unknowable before looking,
+while "is this frame good enough" is the same question for every clip. A cap on
+top of a threshold discards frames that already passed the bar. Set
+`--max-per-clip N` if a runaway clip ever needs one — the run then says the cap
+decided, not the quality.
+
+Two things still limit how many frames a clip can produce, and both are about
+not exporting the same picture twice rather than about counting: the minimum
+gap (`--min-gap`, or 3 % of the clip, whichever is larger) and the duplicate
+test below.
+
+`--min-score 0.60` is **one person's judgement on one card, not a measured
+constant**: Tomas ran 163 of his own files at 0.60 and kept the result, which
+is the only kind of evidence a number like this can have. Every run prints it
+with that caveat attached. When no frame in a clip reaches it, the tool says
+so, names the best score it did see, and tells you to lower the bar; it does
+not quietly write an empty folder.
 
 `--select count` is the old behaviour: aim at `--per-clip`, and report any
 shortfall with a stated reason.
@@ -757,7 +769,7 @@ The only figure measured so far, for reference:
 | Clip | 1920×1080, H.264, 30 fps, 60 s (ffmpeg `testsrc2`) |
 | Machine | 4-core Intel Xeon @ 2.10 GHz container, no GPU |
 | Decode path | CPU (`-hwaccel cuda` failed: `Cannot load libcuda.so.1`) |
-| Settings | defaults (`--select threshold --min-score 0.65 --min-gap 2`), faces on, saliency on |
+| Settings | defaults (`--select threshold --min-score 0.60 --min-gap 2`), faces on, saliency on |
 | Result | **4.7 s per minute of footage** |
 
 This says nothing about the target RTX 2060 machine, about hardware decode, or
@@ -936,11 +948,11 @@ is a reasonable v2), DaVinci Resolve (not required for anything).
 The four open questions in the task document were put to Tomas and answered.
 What that changed:
 
-1. **Per-clip count: quality threshold.** `--select threshold` is now the
-   default: every frame above `--min-score` is taken, two from a weak clip and
-   twelve from a strong one, bounded by `--max-per-clip 12`. The old fixed
-   target is still there as `--select count`. The threshold itself is
-   uncalibrated and everything that prints it says so.
+1. **Per-clip count: quality threshold, and no cap.** `--select threshold` is
+   the default: every frame above `--min-score` is taken, none from a weak clip
+   and fifteen from a strong one, with no upper bound (`--max-per-clip 0`).
+   The old fixed target is still there as `--select count`. The threshold
+   itself is one person's judgement and everything that prints it says so.
 2. **Export resolution: native.** Stills come out at the source resolution —
    4K stays 4K, 2.7K stays 2.7K — and `--export-height 1080` is there when a
    1080p copy is wanted. Format stays JPEG `-q:v 2` by default with
@@ -974,8 +986,8 @@ the window grew a settings block and a per-file table.
   zero, so the nature/city decision is effectively colour-based. If that turns
   out to pick wrong on urban footage, the fix is a better structure measurement,
   not a bigger threshold.
-* Whether `--min-score 0.65` is a sensible default is unknown. It was chosen
-  from the structure of the score, not from measurement: on the synthetic
-  `testsrc2` fixtures the best frame of a clip scores 0.64, so that clip
-  correctly returns nothing and says why. Real footage may want a different
-  number in either direction.
+* `--min-score 0.60` now has exactly one piece of evidence behind it: a
+  163-file run of Tomas's own footage whose result he kept. That is a judgement
+  on one card in one kind of light, not a measured constant — a different
+  camera, or a mixed batch, may want a different number. `framepicker.learn` is
+  the way to find out rather than guess.
