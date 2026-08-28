@@ -9,6 +9,7 @@ options object argparse builds. There is no second code path.
 from __future__ import annotations
 
 import argparse
+import glob
 import os
 import signal
 import sys
@@ -45,6 +46,12 @@ DEFAULT_MIN_GAP = 2.0
 #: rate is lowered and the report says so, instead of the tool quietly eating
 #: all the memory on a long file.
 DEFAULT_MAX_CANDIDATES = 3000
+#: Extensions treated as video when a folder or a wildcard is given. Lives
+#: here, not in the GUI: expanding an input into a file list is logic.
+VIDEO_SUFFIXES = (
+    ".mp4", ".mov", ".mxf", ".mkv", ".avi", ".m4v", ".mts", ".m2ts", ".insv", ".webm",
+)
+
 #: A frame this uniformly black or white is thrown away before any real work.
 CHEAP_REJECT_CLIP_FRACTION = 0.90
 #: Sharpness percentile below which a frame is rejected as soft, for this clip.
@@ -430,6 +437,46 @@ def _log_source_text(source: str) -> str:
 # --------------------------------------------------------------------------
 
 
+def expand_inputs(paths: Sequence[str]) -> tuple[list[str], list[str]]:
+    """Turn CLI arguments into a concrete file list.
+
+    A folder becomes every video file in it, and a wildcard is expanded here
+    rather than by the shell - ``cmd`` and PowerShell do not glob arguments
+    for a Python program, so ``*.MP4`` would otherwise arrive verbatim and
+    match nothing.
+
+    Returns ``(files, unmatched)``; nothing is dropped silently.
+    """
+    files: list[str] = []
+    unmatched: list[str] = []
+    for raw in paths:
+        if os.path.isdir(raw):
+            found = [
+                os.path.join(raw, name)
+                for name in sorted(os.listdir(raw))
+                if name.lower().endswith(VIDEO_SUFFIXES) and os.path.isfile(os.path.join(raw, name))
+            ]
+        elif any(char in raw for char in "*?["):
+            found = sorted(match for match in glob.glob(raw) if os.path.isfile(match))
+        elif os.path.isfile(raw):
+            found = [raw]
+        else:
+            found = []
+        if found:
+            files += found
+        else:
+            unmatched.append(raw)
+
+    seen: set[str] = set()
+    unique: list[str] = []
+    for path in files:
+        key = os.path.normcase(os.path.abspath(path))
+        if key not in seen:
+            seen.add(key)
+            unique.append(path)
+    return unique, unmatched
+
+
 def run_batch(
     options: Options,
     on_message: Callable[[str], None] | None = None,
@@ -445,7 +492,11 @@ def run_batch(
             messenger.say(S.ffmpeg_missing(tool))
             return BatchResult({}, options.out_dir, messages=messenger.log)
 
-    paths = [p for p in options.paths]
+    paths, unmatched = expand_inputs(options.paths)
+    for missing in unmatched:
+        messenger.say(S.input_not_found(missing))
+    if len(paths) != len(options.paths):
+        messenger.say(S.inputs_expanded(len(options.paths), len(paths)))
     if not paths:
         messenger.say(S.no_input_files())
         return BatchResult({}, options.out_dir, messages=messenger.log)
@@ -453,7 +504,7 @@ def run_batch(
     os.makedirs(options.out_dir, exist_ok=True)
 
     clips: list[dict | None] = [None] * len(paths)
-    skipped: list[dict] = []
+    skipped: list[dict] = [{"path": m, "reason": S.input_not_found(m)} for m in unmatched]
     lock = threading.Lock()
 
     def work(index: int, path: str) -> None:
@@ -492,7 +543,7 @@ def run_batch(
         "options": options.as_dict(),
         "weights": dict(scoring.WEIGHTS),
         "summary": {
-            "files_given": len(paths),
+            "files_given": len(paths) + len(unmatched),
             "files_processed": len(done),
             "files_skipped": len(skipped),
             "select_mode": options.select_mode,
@@ -524,10 +575,12 @@ def run_batch(
     created.add(html_path)
 
     if options.select_mode == MODE_THRESHOLD:
-        messenger.say(S.batch_summary_threshold(len(paths), len(done), len(skipped), frames_delivered))
+        messenger.say(S.batch_summary_threshold(
+            len(paths) + len(unmatched), len(done), len(skipped), frames_delivered))
     else:
         messenger.say(S.batch_summary(
-            len(paths), len(done), len(skipped), len(done) * options.per_clip, frames_delivered))
+            len(paths) + len(unmatched), len(done), len(skipped),
+            len(done) * options.per_clip, frames_delivered))
     if skipped:
         messenger.say(S.skipped_files_header())
         for item in skipped:
@@ -563,7 +616,8 @@ def build_parser() -> argparse.ArgumentParser:
         prog="python -m framepicker",
         description="Pick the best frames out of video files and say why.",
     )
-    parser.add_argument("videos", nargs="*", help="video files to analyse")
+    parser.add_argument("videos", nargs="*",
+                        help="video files, folders, or wildcards such as D:/clips/*.MP4")
     parser.add_argument("--out", dest="out_dir", default=DEFAULT_OUT_DIR, help="output directory")
     parser.add_argument("--per-clip", type=int, default=DEFAULT_PER_CLIP,
                         help="frames to pick per clip (count mode only)")

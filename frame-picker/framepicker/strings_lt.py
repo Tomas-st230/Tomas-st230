@@ -96,6 +96,14 @@ def no_input_files() -> str:
     return "Nenurodytas nė vienas vaizdo failas."
 
 
+def input_not_found(path: str) -> str:
+    return f"Pagal nurodymą nerasta nė vieno vaizdo failo: {path}"
+
+
+def inputs_expanded(given: int, found: int) -> str:
+    return f"Nurodyta įvesčių: {given}; rasta vaizdo failų: {found}"
+
+
 def ffmpeg_missing(name: str) -> str:
     return f"Sistemoje nerastas {name}. Įdiekite ffmpeg ir įtraukite jį į PATH."
 

@@ -275,3 +275,61 @@ def test_export_height_is_recorded_and_native_by_default(normal_clip, tmp_path):
                   export_height=120)
     assert S.export_resolution_native() in native.results["clips"][0]["notes"]
     assert S.export_resolution_scaled(120) in scaled.results["clips"][0]["notes"]
+
+
+# --------------------------------------------------------------------------
+# Input expansion
+# --------------------------------------------------------------------------
+
+
+def test_expand_inputs_takes_a_folder(tmp_path):
+    from framepicker.cli import expand_inputs
+
+    folder = tmp_path / "clips"
+    folder.mkdir()
+    (folder / "a.MP4").write_bytes(b"x")
+    (folder / "b.mov").write_bytes(b"x")
+    (folder / "notes.txt").write_bytes(b"x")
+
+    files, unmatched = expand_inputs([str(folder)])
+    assert [os.path.basename(f) for f in files] == ["a.MP4", "b.mov"]
+    assert unmatched == []
+
+
+def test_expand_inputs_globs_because_the_shell_did_not(tmp_path):
+    """cmd and PowerShell hand `*.MP4` to Python verbatim."""
+    from framepicker.cli import expand_inputs
+
+    (tmp_path / "one.MP4").write_bytes(b"x")
+    (tmp_path / "two.MP4").write_bytes(b"x")
+    (tmp_path / "three.mov").write_bytes(b"x")
+
+    files, unmatched = expand_inputs([str(tmp_path / "*.MP4")])
+    assert sorted(os.path.basename(f) for f in files) == ["one.MP4", "two.MP4"]
+    assert unmatched == []
+
+
+def test_expand_inputs_deduplicates_and_names_what_it_could_not_find(tmp_path):
+    from framepicker.cli import expand_inputs
+
+    clip = tmp_path / "a.mp4"
+    clip.write_bytes(b"x")
+    files, unmatched = expand_inputs([str(clip), str(clip), str(tmp_path / "ghost.mp4")])
+    assert len(files) == 1
+    assert unmatched == [str(tmp_path / "ghost.mp4")]
+
+
+@requires_ffmpeg
+def test_a_folder_of_clips_is_processed(normal_clip, blurred_clip, tmp_path):
+    folder = os.path.dirname(normal_clip)
+    result = _run([folder], tmp_path, min_score=0.0, min_gap=1.0, jobs=1)
+    processed = {c["probe"]["name"] for c in result.results["clips"]}
+    assert os.path.basename(normal_clip) in processed
+    assert os.path.basename(blurred_clip) in processed
+
+
+def test_an_input_that_matches_nothing_is_reported_not_ignored(tmp_path):
+    ghost = str(tmp_path / "does-not-exist.mp4")
+    result = run_batch(Options(paths=[ghost], out_dir=str(tmp_path / "out")))
+    assert S.input_not_found(ghost) in result.messages
+    assert S.no_input_files() in result.messages

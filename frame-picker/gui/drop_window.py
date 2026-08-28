@@ -27,10 +27,7 @@ from PySide6.QtWidgets import (
 )
 
 from framepicker import strings_lt as S
-from framepicker.cli import DEFAULT_OUT_DIR, Options, run_batch
-
-VIDEO_SUFFIXES = (".mp4", ".mov", ".mxf", ".mkv", ".avi", ".m4v", ".mts", ".m2ts", ".insv", ".webm")
-
+from framepicker.cli import DEFAULT_OUT_DIR, VIDEO_SUFFIXES, Options, run_batch
 
 class _Worker(QObject):
     message = Signal(str)
