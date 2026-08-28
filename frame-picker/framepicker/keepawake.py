@@ -33,7 +33,10 @@ class KeepAwakeStatus:
         self.detail = detail
 
     def as_dict(self) -> dict:
-        return {"active": self.active, "detail": self.detail}
+        # The platform is recorded because "not active" means something
+        # different on Windows (the call failed) than on Linux (there is
+        # nothing here to call).
+        return {"active": self.active, "detail": self.detail, "platform": sys.platform}
 
 
 def _windows_set(flags: int) -> bool:

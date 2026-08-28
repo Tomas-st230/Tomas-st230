@@ -644,6 +644,8 @@ def run_folder_created(path: str) -> str:
 
 
 def integrity_links(checked: int, broken: int) -> str:
+    if not checked:
+        return "Ataskaitos sąsajų nebuvo ko tikrinti: ataskaitoje nėra nė vieno kadro."
     if broken:
         return f"Ataskaitos sąsajos: patikrinta {checked}, neveikia {broken}."
     return f"Ataskaitos sąsajos: patikrinta {checked}, visos veikia."
