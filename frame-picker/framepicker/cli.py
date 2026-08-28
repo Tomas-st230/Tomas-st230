@@ -1010,7 +1010,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--normalise-strength", type=float, default=1.0,
                         help="strength of the no-LUT log fallback, 0 = off, 1 = full")
     parser.add_argument("--look", choices=grading.available(), default=grading.NONE,
-                        help="named look for the exported stills: 'nature', 'city' or 'none'")
+                        help="look for the exported stills: 'auto' measures each clip and "
+                             "picks one, or name it yourself: 'nature', 'city', 'none'")
     parser.add_argument("--look-strength", type=float, default=grading.DEFAULT_STRENGTH,
                         help="how far toward the look's targets to travel, 0 = off, 1 = full")
     parser.add_argument("--jobs", type=int, default=0, help="files processed in parallel (0 = auto)")

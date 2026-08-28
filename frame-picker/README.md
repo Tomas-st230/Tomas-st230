@@ -74,22 +74,45 @@ git checkout claude/best-frame-picker-tool-e25ekc
 git pull origin claude/best-frame-picker-tool-e25ekc
 
 cd frame-picker
-..\.venv\Scripts\Activate.ps1          # wherever your venv is
-python -m pip install -e ".[gui,dev]"    # only needed if dependencies changed
-python -m pytest -q                       # 178 tests; if any fail, stop and send the output
+python -m pip install -e ".[gui,dev]"    # re-run after every pull; it is quick when nothing changed
+python -m pytest -q                       # 179 tests; if any fail, stop and send the output
 python -m gui.drop_window
 ```
 
-Three things worth knowing while updating:
+**About the virtual environment.** If you never made one, the commands above
+are complete — they use the Python on your `PATH`, which is how this copy was
+installed. If you did make one, activate it before the `pip install` line.
+Find it, if you are not sure:
 
-* **Nothing in your output folders is touched by an update.** Each run has
-  always written into its own `run-<date>-<time>` folder since this version, so
-  old runs stay exactly as they were.
+```powershell
+Get-ChildItem C:\Users\tomas -Filter Activate.ps1 -Recurse -ErrorAction SilentlyContinue |
+  Select-Object -First 5 FullName
+python -c "import sys; print(sys.executable)"        # which Python you are actually using
+```
+
+`..\.venv\Scripts\Activate.ps1` failing with *"is not recognized"* simply means
+there is no venv at that path. That is not an error to fix — either skip the
+line, or create one and install into it:
+
+```powershell
+python -m venv C:\Users\tomas\Tomas-st230\.venv
+C:\Users\tomas\Tomas-st230\.venv\Scripts\Activate.ps1
+python -m pip install -e ".[gui,dev]"
+```
+
+Four more things worth knowing while updating:
+
+* **Always re-run `pip install -e ".[gui,dev]"` after a pull.** New modules
+  (`sidecar.py`, `runlog.py`, `learn.py`) are picked up automatically by the
+  editable install, but a new dependency would not be.
+* **`--look auto: invalid choice`** means the code is still the old one: the
+  pull has not happened yet, or it landed in a different folder than the one
+  you are running from. Check with
+  `python -m framepicker --help | Select-String "look"`.
+* **Nothing in your output folders is touched by an update.** Each run writes
+  into its own `run-<date>-<time>` folder, so old runs stay as they were.
 * **If `git pull` refuses because of local changes**, `git stash` them first (or
   `git checkout -- .` to throw them away), then pull.
-* **If `pytest` cannot find `framepicker`**, you are in the wrong folder or the
-  wrong venv: the tests run from `frame-picker/`, with that venv active. Check
-  with `python -c "import framepicker, sys; print(sys.executable)"`.
 
 To see what changed since your copy:
 
