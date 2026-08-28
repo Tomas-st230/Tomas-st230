@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from . import proc
 from . import strings_lt as S
 from . import grading
+from . import decode
 from .decode import Normalisation, escape_filter_path
 
 FFMPEG = "ffmpeg"
@@ -44,7 +45,8 @@ def output_name(clip_name: str, rank: int, timestamp: float, score: float, suffi
     return f"{safe_stem(clip_name)}_{rank:02d}_{timestamp:08.3f}s_{score:.3f}.{suffix}"
 
 
-def build_export_filter(lut_path: str | None, height: int = 0) -> str | None:
+def build_export_filter(lut_path: str | None, height: int = 0,
+                        lut_strength: float = 1.0) -> str | None:
     """Filter chain for the exported still, or ``None`` when nothing is needed.
 
     *height* of 0 keeps the source resolution - 4K stays 4K, 2.7K stays 2.7K.
@@ -52,8 +54,10 @@ def build_export_filter(lut_path: str | None, height: int = 0) -> str | None:
     1080p is left alone rather than upscaled.
     """
     parts: list[str] = []
-    if lut_path:
-        parts.append(f"lut3d=file='{escape_filter_path(lut_path)}'")
+    if lut_path and lut_strength > decode.LUT_STRENGTH_MIN:
+        # The same fragment the analysis uses, so what was measured is what
+        # gets written.
+        parts.append(decode.lut_graph(lut_path, lut_strength))
     if height and height > 0:
         parts.append(f"scale=-2:'min(ih,{int(height)})':flags=lanczos")
     return ",".join(parts) if parts else None
@@ -69,6 +73,7 @@ def export_frame(
     quality: int = 2,
     image_format: str = "jpg",
     height: int = 0,
+    lut_strength: float = 1.0,
     look: grading.Look | None = None,
     look_strength: float = grading.DEFAULT_STRENGTH,
 ) -> ExportResult:
@@ -89,7 +94,7 @@ def export_frame(
         "-map", "0:v:0",
         "-frames:v", "1",
     ]
-    video_filter = build_export_filter(lut_path, height)
+    video_filter = build_export_filter(lut_path, height, lut_strength)
     if video_filter:
         argv += ["-vf", video_filter]
     if image_format.lower() in ("jpg", "jpeg"):
@@ -159,6 +164,7 @@ def export_selection(
     quality: int = 2,
     image_format: str = "jpg",
     height: int = 0,
+    lut_strength: float = 1.0,
     look: grading.Look | None = None,
     look_strength: float = grading.DEFAULT_STRENGTH,
     cancel=None,
@@ -175,6 +181,7 @@ def export_selection(
             candidate.t,
             os.path.join(out_dir, name),
             lut_path=lut_path,
+            lut_strength=lut_strength,
             normalisation=normalisation,
             quality=quality,
             image_format=image_format,

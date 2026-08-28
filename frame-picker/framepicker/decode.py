@@ -73,6 +73,139 @@ class DecodeError(RuntimeError):
 
 
 # --------------------------------------------------------------------------
+# Is the conversion an improvement, or is it wrecking the picture?
+# --------------------------------------------------------------------------
+#
+# Applying a D-Log LUT rests on one premise: the source is flat and the LUT
+# makes it normal. When that premise is wrong the LUT does the opposite - it
+# stretches contrast that is already there and pushes colour that is already
+# there, which is exactly what "too much of everything" looks like.
+#
+# The premise is now measured instead of assumed. Measured on Tomas's card:
+# 162 of 163 files are 10-bit, yet their saturation runs 0.065-0.765 and their
+# luma span 0.155-0.939 - one continuous distribution covering everything from
+# genuinely flat to fully graded. Bit depth alone therefore cannot say what a
+# file is, so the conversion is tried on a handful of frames and compared with
+# the same frames untouched. If the result is *less* normal than what went in,
+# the LUT is dropped for that clip and the report says which measurement
+# refused it.
+
+#: Mean HSV saturation the converted frames may not exceed - but only when the
+#: conversion is what put them there. Footage that arrives colourful and comes
+#: out equally colourful is not the LUT's doing, and refusing it would punish
+#: the source for what it already was.
+CONVERSION_MAX_SATURATION = 0.55
+#: Increase, relative to the source, above which the ceiling starts to apply.
+CONVERSION_SATURATION_NOTICEABLE = 1.05
+#: ...nor may the conversion multiply the saturation by more than this. Same
+#: measurement: 1.85x at full strength, 1.57x at 0.75, 1.34x at 0.5.
+CONVERSION_MAX_SATURATION_GAIN = 1.45
+#: Newly blown highlights the conversion may add (fraction of the frame).
+CONVERSION_MAX_NEW_HIGH_CLIP = 0.05
+#: Newly crushed blacks it may add. Measured on Tomas's own D-Log clips with
+#: his own cube: at full strength the LUT pushed 12 % of every frame to black
+#: (0.005 -> 0.122), at 0.75 6 %, at 0.5 2 %. A conversion that buries a
+#: twentieth of the picture is doing more than converting.
+CONVERSION_MAX_NEW_LOW_CLIP = 0.04
+#: A log-to-display conversion opens the range up. If it closes it instead,
+#: the source was not log: the converted span must keep at least this share.
+CONVERSION_MIN_SPAN_KEPT = 0.90
+
+
+@dataclass
+class ConversionCheck:
+    """What a conversion did to a few sample frames, and whether to keep it."""
+
+    ok: bool
+    reason: str                 # "" | saturation | gain | highlights | shadows | flattened | no-frames
+    before: dict | None = None
+    after: dict | None = None
+
+    def as_dict(self) -> dict:
+        return {
+            "ok": self.ok,
+            "reason": self.reason,
+            "before": self.before,
+            "after": self.after,
+            "limits": {
+                "max_saturation": CONVERSION_MAX_SATURATION,
+                "max_saturation_gain": CONVERSION_MAX_SATURATION_GAIN,
+                "max_new_high_clip": CONVERSION_MAX_NEW_HIGH_CLIP,
+                "max_new_low_clip": CONVERSION_MAX_NEW_LOW_CLIP,
+                "min_span_kept": CONVERSION_MIN_SPAN_KEPT,
+            },
+        }
+
+
+def _picture_stats(samples: Sequence[np.ndarray]) -> dict | None:
+    """Mean saturation, luma span and clipping over a few frames."""
+    from .features import dynamic_range, exposure_clip_high, exposure_clip_low, saturation_mean
+
+    usable = [s for s in samples if s is not None and getattr(s, "size", 0)]
+    if not usable:
+        return None
+    return {
+        "saturation": float(sum(saturation_mean(f) for f in usable) / len(usable)),
+        "luma_span": float(sum(dynamic_range(f) for f in usable) / len(usable)),
+        "clip_high": float(sum(exposure_clip_high(f) for f in usable) / len(usable)),
+        "clip_low": float(sum(exposure_clip_low(f) for f in usable) / len(usable)),
+        "frames_measured": len(usable),
+    }
+
+
+def blend_frames(
+    raw: Sequence[np.ndarray], converted: Sequence[np.ndarray], strength: float
+) -> list[np.ndarray]:
+    """``strength`` of *converted* over *raw*, per pixel.
+
+    The same linear mix ffmpeg's ``blend`` performs, done here so that every
+    candidate strength can be measured from **one** extra decode instead of
+    one decode each. What finally gets exported is still ffmpeg's own blend.
+    """
+    strength = float(min(1.0, max(0.0, strength)))
+    out: list[np.ndarray] = []
+    for a, b in zip(raw, converted):
+        if a is None or b is None or a.shape != b.shape:
+            continue
+        mixed = a.astype(np.float32) * (1.0 - strength) + b.astype(np.float32) * strength
+        out.append(np.clip(mixed, 0, 255).astype(np.uint8))
+    return out
+
+
+def check_conversion(
+    before: Sequence[np.ndarray], after: Sequence[np.ndarray]
+) -> ConversionCheck:
+    """Compare the same frames with and without the conversion.
+
+    Returns ``ok=False`` and the name of the measurement that refused it. A
+    conversion is never rejected for being *subtle* - only for overshooting.
+    """
+    stats_before = _picture_stats(before)
+    stats_after = _picture_stats(after)
+    if stats_before is None or stats_after is None:
+        return ConversionCheck(False, "no-frames", stats_before, stats_after)
+
+    gain = (
+        stats_after["saturation"] / stats_before["saturation"]
+        if stats_before["saturation"] > 1e-3 else 1.0
+    )
+    if (
+        stats_after["saturation"] > CONVERSION_MAX_SATURATION
+        and gain > CONVERSION_SATURATION_NOTICEABLE
+    ):
+        return ConversionCheck(False, "saturation", stats_before, stats_after)
+    if gain > CONVERSION_MAX_SATURATION_GAIN:
+        return ConversionCheck(False, "gain", stats_before, stats_after)
+    if stats_after["clip_high"] - stats_before["clip_high"] > CONVERSION_MAX_NEW_HIGH_CLIP:
+        return ConversionCheck(False, "highlights", stats_before, stats_after)
+    if stats_after["clip_low"] - stats_before["clip_low"] > CONVERSION_MAX_NEW_LOW_CLIP:
+        return ConversionCheck(False, "shadows", stats_before, stats_after)
+    if stats_after["luma_span"] < CONVERSION_MIN_SPAN_KEPT * stats_before["luma_span"]:
+        return ConversionCheck(False, "flattened", stats_before, stats_after)
+    return ConversionCheck(True, "", stats_before, stats_after)
+
+
+# --------------------------------------------------------------------------
 # Log detection
 # --------------------------------------------------------------------------
 
@@ -344,18 +477,48 @@ def escape_filter_path(path: str) -> str:
     return text
 
 
+#: Strength below which a LUT is not worth applying at all.
+LUT_STRENGTH_MIN = 0.05
+
+
+def lut_graph(lut_path: str, strength: float = 1.0) -> str:
+    """The LUT as a filtergraph fragment, at *strength* between 0 and 1.
+
+    At full strength this is just ``lut3d``. Below it, the converted image is
+    blended back over the original - which is what "convert it, but less" has
+    to mean for a 3D LUT: there is no dial inside a cube file.
+
+    Partial strength exists because a LUT can be too strong for the footage it
+    is pointed at, and measurably was: on Tomas's D-Log clips his D-Log M cube
+    took mean saturation 0.210 -> 0.384 and pushed 7 % of every frame to black,
+    while the same cube at 0.5 gave 0.280 and 0.7 %.
+    """
+    lut = f"lut3d=file='{escape_filter_path(lut_path)}'"
+    strength = float(min(1.0, max(0.0, strength)))
+    if strength >= 1.0:
+        return lut
+    # [top]=converted over [bottom]=original; all_opacity is the top layer's.
+    return (
+        f"split[fp_a][fp_b];[fp_b]{lut}[fp_l];"
+        f"[fp_l][fp_a]blend=all_mode=normal:all_opacity={strength:.4f}"
+    )
+
+
 def build_video_filter(
     out_w: int,
     out_h: int,
     fps: float | None,
     lut_path: str | None,
+    lut_strength: float = 1.0,
 ) -> str:
     parts: list[str] = []
     if fps:
         parts.append(f"fps={fps}")
     parts.append(f"scale={out_w}:{out_h}:flags=area")
-    if lut_path:
-        parts.append(f"lut3d=file='{escape_filter_path(lut_path)}'")
+    if lut_path and lut_strength > LUT_STRENGTH_MIN:
+        # format first: blend needs both branches in the same pixel format.
+        parts.append("format=rgb24")
+        parts.append(lut_graph(lut_path, lut_strength))
     parts.append("format=rgb24")
     return ",".join(parts)
 
@@ -371,6 +534,7 @@ def build_gpu_video_filter(
     fps: float | None,
     lut_path: str | None,
     scaler: str = "scale_cuda",
+    lut_strength: float = 1.0,
 ) -> str:
     """The same chain, but the frame stays on the GPU until it is small.
 
@@ -386,12 +550,14 @@ def build_gpu_video_filter(
     parts: list[str] = []
     if fps:
         parts.append(f"fps={fps}")
-    parts.append(f"{scaler}={out_w}:{out_h}")
+    # Named options on purpose: scale_npp rejects positional w:h ("No option
+    # name near '640:360'" in a real run), while scale_cuda accepts both.
+    parts.append(f"{scaler}=w={out_w}:h={out_h}")
     parts.append("hwdownload")
     parts.append("format=nv12")
-    if lut_path:
+    if lut_path and lut_strength > LUT_STRENGTH_MIN:
         parts.append("format=rgb24")
-        parts.append(f"lut3d=file='{escape_filter_path(lut_path)}'")
+        parts.append(lut_graph(lut_path, lut_strength))
     parts.append("format=rgb24")
     return ",".join(parts)
 
@@ -492,6 +658,7 @@ def sample_frames(
     *,
     long_edge: int = ANALYSIS_LONG_EDGE,
     lut_path: str | None = None,
+    lut_strength: float = 1.0,
     hwaccel: str = "auto",
     max_candidates: int | None = None,
     keyframes_only: bool = False,
@@ -521,7 +688,7 @@ def sample_frames(
         report.frames_expected = max(1, int(clip.duration * effective_fps))
 
     out_w, out_h = analysis_size(int(clip.width or 0), int(clip.height or 0), long_edge)
-    vf = build_video_filter(out_w, out_h, effective_fps, lut_path)
+    vf = build_video_filter(out_w, out_h, effective_fps, lut_path, lut_strength)
 
     use_hw = False
     name = "cuda" if hwaccel == "auto" else hwaccel
@@ -541,7 +708,7 @@ def sample_frames(
             report.gpu_scale_error = why
     report.gpu_scaler = scaler
     if scaler:
-        vf = build_gpu_video_filter(out_w, out_h, effective_fps, lut_path, scaler)
+        vf = build_gpu_video_filter(out_w, out_h, effective_fps, lut_path, scaler, lut_strength)
 
     argv = [FFMPEG, "-hide_banner", "-nostdin", "-loglevel", "error", "-nostats"]
     if use_hw:
@@ -587,6 +754,7 @@ def sample_for_normalisation(
     count: int = 12,
     long_edge: int = 256,
     lut_path: str | None = None,
+    lut_strength: float = 1.0,
 ) -> list[np.ndarray]:
     """Decode a few frames spread over the clip, to derive one fixed transform."""
     if not clip.duration or clip.duration <= 0:
@@ -600,6 +768,7 @@ def sample_for_normalisation(
         sample_fps,
         long_edge=long_edge,
         lut_path=lut_path,
+        lut_strength=lut_strength,
         hwaccel="none",
         report=report,
     ):

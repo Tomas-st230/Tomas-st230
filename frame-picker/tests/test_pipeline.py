@@ -9,7 +9,9 @@ import numpy as np
 
 from framepicker import features, report, scoring
 from framepicker import strings_lt as S
-from framepicker.cli import Options, run_batch
+import pytest
+
+from framepicker.cli import LUT_STRENGTH_LADDER, Options, run_batch
 from framepicker.decode import detect_log
 from framepicker.probe import probe
 from framepicker.select import MODE_COUNT, MODE_THRESHOLD
@@ -740,3 +742,125 @@ def test_the_shipped_defaults_are_threshold_060_and_no_cap(normal_clip, tmp_path
     assert selection["capped"] is False, "nothing may cap a run at the defaults"
     assert selection["delivered"] == selection["passed_threshold"] - (
         selection["rejected_time_gap"] + selection["rejected_duplicate"])
+
+
+# --------------------------------------------------------------------------
+# A conversion has to prove it improves the picture
+# --------------------------------------------------------------------------
+
+
+def _cube(path, mapping) -> str:
+    """Write a 3D LUT that applies *mapping* to each channel."""
+    size = 8
+    lines = [f"LUT_3D_SIZE {size}", ""]
+    for b in range(size):
+        for g in range(size):
+            for r in range(size):
+                values = [mapping(v / (size - 1)) for v in (r, g, b)]
+                lines.append(" ".join(f"{min(1.0, max(0.0, v)):.6f}" for v in values))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return str(path)
+
+
+@requires_ffmpeg
+def test_a_lut_that_overshoots_is_refused_and_the_original_kept(flat_clip, tmp_path):
+    """The 163-file run's real defect: a conversion that made the picture worse.
+
+    Measured on Tomas's own clips with his own cube: full strength took mean
+    saturation 0.210 -> 0.384 and pushed 12 % of every frame to black. That is
+    what "too much of everything" is, and it is now measured rather than shipped.
+    """
+    from framepicker import decode
+
+    harsh = _cube(tmp_path / "harsh.cube", lambda v: 3.2 * (v - 0.40))
+    result = run_batch(Options(paths=[flat_clip], out_dir=str(tmp_path / "out"), per_clip=2,
+                              min_gap=1.0, select_mode=MODE_COUNT, lut=harsh))
+    clip = result.results["clips"][0]
+    check = clip["color"]["check"]
+    assert check is not None
+    assert check["ok"] is False, check
+    assert check["reason"] in ("shadows", "gain", "saturation", "highlights", "flattened")
+    assert clip["color"]["mode"] == "none", "the original must be kept untouched"
+    assert clip["color"]["lut"] is None
+    assert any(S.conversion_reason(check["reason"]) in note for note in clip["notes"])
+    # every rung of the ladder was tried before giving up
+    assert [entry["strength"] for entry in check["tried"]] == list(LUT_STRENGTH_LADDER)
+    assert decode.CONVERSION_MAX_NEW_LOW_CLIP <= 0.05
+
+
+@requires_ffmpeg
+def test_a_lut_that_is_only_a_little_strong_is_softened_not_dropped(flat_clip, tmp_path):
+    """"Convert it, but less" - the answer when full strength overshoots."""
+    strong = _cube(tmp_path / "strong.cube", lambda v: 1.9 * (v - 0.28))
+    result = run_batch(Options(paths=[flat_clip], out_dir=str(tmp_path / "out"), per_clip=1,
+                              min_gap=1.0, select_mode=MODE_COUNT, lut=strong))
+    clip = result.results["clips"][0]
+    check = clip["color"]["check"]
+    assert clip["color"]["mode"] == "lut"
+    assert check["ok"] is True
+    assert 0.0 < check["strength"] < 1.0, check["tried"]
+    assert clip["color"]["lut_strength"] == check["strength"]
+    assert any(S.conversion_softened(check["strength"], 0.0, 0.0)[:30] in note
+               for note in clip["notes"])
+
+
+@requires_ffmpeg
+def test_a_gentle_lut_is_applied_in_full(flat_clip, tmp_path):
+    gentle = _cube(tmp_path / "gentle.cube", lambda v: 1.15 * (v - 0.05))
+    result = run_batch(Options(paths=[flat_clip], out_dir=str(tmp_path / "out"), per_clip=1,
+                              min_gap=1.0, select_mode=MODE_COUNT, lut=gentle))
+    clip = result.results["clips"][0]
+    assert clip["color"]["mode"] == "lut"
+    assert clip["color"]["check"]["ok"] is True
+    assert clip["color"]["check"]["strength"] == 1.0
+    assert clip["color"]["lut_strength"] == 1.0
+
+
+@requires_ffmpeg
+def test_an_explicit_strength_is_used_as_given(flat_clip, tmp_path):
+    identity = _cube(tmp_path / "identity.cube", lambda v: v)
+    result = run_batch(Options(paths=[flat_clip], out_dir=str(tmp_path / "out"), per_clip=1,
+                              min_gap=1.0, select_mode=MODE_COUNT, lut=identity,
+                              lut_strength=0.4))
+    clip = result.results["clips"][0]
+    assert clip["color"]["check"]["strength"] == pytest.approx(0.4)
+    assert clip["color"]["check"]["tried"] == [], "no ladder when a number was given"
+
+
+def test_the_blend_is_linear_so_the_ladder_costs_one_decode():
+    from framepicker import decode
+
+    raw = [np.zeros((8, 8, 3), np.uint8)]
+    converted = [np.full((8, 8, 3), 200, np.uint8)]
+    assert decode.blend_frames(raw, converted, 0.0)[0].mean() == 0
+    assert decode.blend_frames(raw, converted, 1.0)[0].mean() == 200
+    assert decode.blend_frames(raw, converted, 0.5)[0].mean() == pytest.approx(100, abs=1)
+
+
+def test_footage_that_arrives_colourful_is_not_blamed_on_the_conversion():
+    """The ceiling is about what the conversion added, not what the source was."""
+    from framepicker import decode
+
+    rng = np.random.default_rng(0)
+    vivid = [np.stack([
+        np.full((16, 16), 240, np.uint8),
+        np.full((16, 16), 30, np.uint8),
+        np.full((16, 16), 30, np.uint8),
+    ], axis=-1) for _ in range(3)]
+    assert decode._picture_stats(vivid)["saturation"] > decode.CONVERSION_MAX_SATURATION
+    assert decode.check_conversion(vivid, [f.copy() for f in vivid]).ok is True
+    del rng
+
+
+@requires_ffmpeg
+def test_forcing_the_lut_keeps_it_but_says_what_is_wrong_with_it(flat_clip, tmp_path):
+    """--convert-log on is the user overruling the measurement, not silencing it."""
+    harsh = _cube(tmp_path / "harsh.cube", lambda v: 3.2 * (v - 0.40))
+    result = run_batch(Options(paths=[flat_clip], out_dir=str(tmp_path / "out"), per_clip=1,
+                              min_gap=1.0, select_mode=MODE_COUNT, lut=harsh,
+                              convert_log="on"))
+    clip = result.results["clips"][0]
+    assert clip["color"]["mode"] == "lut", "the user asked for it"
+    assert clip["color"]["check"]["ok"] is False
+    assert any(S.conversion_forced(S.conversion_reason(clip["color"]["check"]["reason"])) == note
+               for note in clip["notes"])

@@ -878,3 +878,67 @@ VALUE_LABELS = {
 }
 GUI_YES = "taip"
 GUI_NO = "ne"
+
+
+# --------------------------------------------------------------------------
+# Konvertavimo (LUT) patikra: ar ji tikrai pagerina vaizdą?
+# --------------------------------------------------------------------------
+
+CONVERSION_REASONS = {
+    "saturation": "po konvertavimo spalvos per sodrios",
+    "gain": "konvertavimas per daug padidino sodrumą",
+    "highlights": "konvertavimas išdegino šviesias vietas",
+    "shadows": "konvertavimas užgniaužė šešėlius",
+    "flattened": "konvertavimas suplokštino vaizdą, nors turėtų jį atverti",
+    "no-frames": "nebuvo ką palyginti",
+}
+
+
+def conversion_reason(reason: str) -> str:
+    return CONVERSION_REASONS.get(reason, reason)
+
+
+def conversion_ok(sat_before: float, sat_after: float, span_before: float, span_after: float) -> str:
+    return (
+        f"Konvertavimas patikrintas: sodrumas {sat_before:.3f} → {sat_after:.3f}, "
+        f"šviesumo diapazonas {span_before:.3f} → {span_after:.3f}. Vaizdas pagerėjo, LUT paliekamas."
+    )
+
+
+def conversion_rejected(reason: str, sat_before: float, sat_after: float) -> str:
+    return (
+        f"LUT ATŠAUKTAS šiam failui: {reason} (sodrumas {sat_before:.3f} → {sat_after:.3f}). "
+        "Originalas jau atrodo teisingai, todėl paliekamas nekeistas. "
+        "Norėdami vis tiek taikyti — --lut-all arba --convert-log on."
+    )
+
+
+def conversion_forced(reason: str) -> str:
+    return (
+        f"Įspėjimas: {reason}, bet konvertavimas paliktas, nes jį nurodėte priverstinai "
+        "(--lut-all arba --convert-log on)."
+    )
+
+
+def conversion_not_checked() -> str:
+    return (
+        "Konvertavimo patikra nevykdyta: nebuvo iš ko paimti pavyzdinių kadrų "
+        "(--convert-log off išjungia ir patikrą)."
+    )
+
+
+def conversion_softened(strength: float, sat_before: float, sat_after: float) -> str:
+    return (
+        f"LUT pritaikytas tik {strength * 100:.0f} % stiprumu — pilnas buvo per stiprus šiai "
+        f"medžiagai (sodrumas {sat_before:.3f} → {sat_after:.3f}). Stiprumą galima nurodyti "
+        "ranka: --lut-strength 0..1."
+    )
+
+GUI_LUT_STRENGTH = "LUT stiprumas"
+GUI_LUT_STRENGTH_AUTO = "parinkti automatiškai (išmatuojant)"
+GUI_LUT_STRENGTH_HINT = (
+    "Kiekvienam failui išmatuojama, ką LUT daro su vaizdu, ir paliekamas stipriausias "
+    "variantas, kuris neperšauna: nepersodrina spalvų, neišdegina šviesių vietų ir "
+    "neužgniaužia šešėlių. Jei net silpniausias kenkia — LUT nenaudojamas, o originalas "
+    "paliekamas nekeistas."
+)

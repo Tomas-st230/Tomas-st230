@@ -67,6 +67,15 @@ VIDEO_SUFFIXES = (
     ".mp4", ".mov", ".mxf", ".mkv", ".avi", ".m4v", ".mts", ".m2ts", ".insv", ".webm",
 )
 
+#: Strengths tried for a LUT, strongest first, when none was asked for.
+#:
+#: A cube file has no dial inside it, so "convert, but less" means blending the
+#: converted image back over the original. The ladder exists because a LUT can
+#: be too strong for the footage it is pointed at: measured on Tomas's D-Log
+#: clips, his D-Log M cube at full strength took saturation 0.210 -> 0.384 and
+#: pushed 12 % of every frame to black, while 0.5 gave 0.278 and 2 %.
+LUT_STRENGTH_LADDER = (1.0, 0.75, 0.5, 0.25)
+
 #: Analysis may run on DJI's ``.LRF`` proxy instead of the master file.
 PROXY_AUTO = "auto"
 PROXY_OFF = "off"
@@ -119,6 +128,8 @@ class Options:
     lut: str | None = None
     lut_all: bool = False
     normalise_strength: float = 1.0
+    #: ``None`` = measure and choose; a number = use exactly that.
+    lut_strength: float | None = None
     look: str = grading.NONE
     look_strength: float = grading.DEFAULT_STRENGTH
     jobs: int = 0
@@ -150,6 +161,7 @@ class Options:
             "lut": self.lut,
             "lut_all": self.lut_all,
             "normalise_strength": self.normalise_strength,
+            "lut_strength": self.lut_strength,
             "look": self.look,
             "look_strength": self.look_strength,
             "jobs": self.jobs,
@@ -365,7 +377,49 @@ def analyse_clip(
                 _note(record, messenger, S.lut_forced_on_all())
         else:
             _note(record, messenger, S.lut_skipped_not_log())
-    if lut_path is None and verdict.is_log and options.normalise_strength > 0:
+    # -- does the conversion actually improve the picture? ------------------
+    # Applying a LUT is a claim about the source, and the claim is now tested
+    # rather than trusted: the same frames are decoded again through the LUT
+    # and compared with the untouched ones. Tomas's card is the reason - 162 of
+    # its 163 files are 10-bit, but their measured saturation and contrast are
+    # those of ordinary footage, so the LUT was being applied to pictures that
+    # were already right and made them gaudy.
+    lut_strength = 1.0
+    if lut_path is not None:
+        forced = options.lut_all or options.convert_log == "on"
+        if not samples:
+            _note(record, messenger, S.conversion_not_checked())
+        else:
+            lut_strength, check, tried = choose_lut_strength(
+                analysis_clip, lut_path, samples, options.lut_strength)
+            record["color_check"] = check.as_dict()
+            record["color_check"]["strength"] = lut_strength
+            record["color_check"]["tried"] = [
+                {"strength": s, "ok": c.ok, "reason": c.reason} for s, c in tried
+            ]
+            if check.ok and lut_strength >= 1.0:
+                _note(record, messenger, S.conversion_ok(
+                    check.before["saturation"], check.after["saturation"],
+                    check.before["luma_span"], check.after["luma_span"]))
+            elif check.ok:
+                _note(record, messenger, S.conversion_softened(
+                    lut_strength, check.before["saturation"], check.after["saturation"]))
+            elif forced:
+                _note(record, messenger, S.conversion_forced(
+                    S.conversion_reason(check.reason)))
+            else:
+                lut_path = None
+                _note(record, messenger, S.conversion_rejected(
+                    S.conversion_reason(check.reason),
+                    (check.before or {}).get("saturation", 0.0),
+                    (check.after or {}).get("saturation", 0.0)))
+
+    if (
+        lut_path is None
+        and verdict.is_log
+        and options.normalise_strength > 0
+        and record.get("color_check") is None      # not a LUT the check just refused
+    ):
         normalisation = (
             decode.estimate_normalisation(samples, options.normalise_strength) if samples else None
         )
@@ -376,6 +430,8 @@ def analyse_clip(
         record["notes"].append(S.no_conversion_applied())
     record["color"] = {
         "mode": "lut" if lut_path else ("normalise" if normalisation else "none"),
+        "check": record.get("color_check"),
+        "lut_strength": lut_strength if lut_path else None,
         "lut": lut_path,
         "normalisation": normalisation.as_dict() if normalisation else None,
     }
@@ -413,6 +469,7 @@ def analyse_clip(
         analysis_clip,
         options.fps,
         lut_path=lut_path,
+        lut_strength=lut_strength,
         hwaccel=options.hwaccel,
         max_candidates=options.max_candidates,
         keyframes_only=options.keyframes,
@@ -592,6 +649,7 @@ def analyse_clip(
             selection.selected,
             options.out_dir,
             lut_path=lut_path,
+            lut_strength=lut_strength,
             normalisation=normalisation,
             quality=options.jpeg_quality,
             image_format=options.image_format,
@@ -629,6 +687,37 @@ def analyse_clip(
     else:
         messenger.say(S.clip_done(clip.name, len(record["frames"]), options.per_clip, record["elapsed_s"]))
     return record
+
+
+def choose_lut_strength(
+    clip,
+    lut_path: str,
+    raw_samples: list,
+    requested: float | None,
+) -> tuple[float, "decode.ConversionCheck", list]:
+    """How much of the LUT this clip can take, measured rather than assumed.
+
+    One extra decode: the same frames through the LUT at full strength. Every
+    intermediate strength is then a linear blend of the two, so the whole
+    ladder costs nothing more. Returns the chosen strength, the check that
+    settled it, and every rung tried.
+    """
+    converted = decode.sample_for_normalisation(clip, lut_path=lut_path)
+    if requested is not None:
+        blended = decode.blend_frames(raw_samples, converted, requested)
+        return float(requested), decode.check_conversion(raw_samples, blended), []
+
+    tried: list[tuple[float, decode.ConversionCheck]] = []
+    for strength in LUT_STRENGTH_LADDER:
+        blended = (
+            converted if strength >= 1.0
+            else decode.blend_frames(raw_samples, converted, strength)
+        )
+        check = decode.check_conversion(raw_samples, blended)
+        tried.append((strength, check))
+        if check.ok:
+            return strength, check, tried
+    return 0.0, tried[-1][1], tried
 
 
 def _note(record: dict, messenger: Messenger, text: str) -> None:
@@ -1008,6 +1097,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="path to a .cube LUT, applied only to clips detected as log")
     parser.add_argument("--lut-all", action="store_true",
                         help="apply --lut to every clip, log or not (wrecks Rec.709 footage)")
+    parser.add_argument("--lut-strength", default="auto",
+                        help="how much of the LUT to apply: 'auto' measures each clip and "
+                             "picks the strongest setting that does not overshoot, or give "
+                             "a number 0..1")
     parser.add_argument("--normalise-strength", type=float, default=1.0,
                         help="strength of the no-LUT log fallback, 0 = off, 1 = full")
     parser.add_argument("--look", choices=grading.available(), default=grading.NONE,
@@ -1040,6 +1133,14 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _lut_strength_arg(value: str) -> float | None:
+    """``auto`` -> None (measure it), otherwise a number between 0 and 1."""
+    text = str(value).strip().lower()
+    if text in ("", "auto"):
+        return None
+    return min(1.0, max(0.0, float(text)))
+
+
 def options_from_args(args: argparse.Namespace) -> Options:
     return Options(
         paths=list(args.videos),
@@ -1051,6 +1152,7 @@ def options_from_args(args: argparse.Namespace) -> Options:
         lut=args.lut,
         lut_all=args.lut_all,
         normalise_strength=args.normalise_strength,
+        lut_strength=_lut_strength_arg(args.lut_strength),
         look=args.look,
         look_strength=args.look_strength,
         jobs=args.jobs,

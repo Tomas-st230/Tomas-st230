@@ -257,6 +257,8 @@ def test_the_settings_reach_the_options_object(window, tmp_path):
     window._jobs.setValue(3)
     window._order_box.setCurrentIndex(1)            # by name
     window._normalise.setValue(0.4)
+    window._lut_auto.setChecked(False)
+    window._lut_strength.setValue(0.35)
     window._proxy.setChecked(False)
     window._keyframes.setChecked(True)
     window._gpu_scale.setChecked(False)
@@ -271,6 +273,7 @@ def test_the_settings_reach_the_options_object(window, tmp_path):
     assert (options.global_top, options.max_candidates) == (7, 500)
     assert (options.hwaccel, options.jobs, options.order) == ("none", 3, "name")
     assert options.normalise_strength == pytest.approx(0.4)
+    assert options.lut_strength == pytest.approx(0.35)
     assert options.proxy == PROXY_OFF
     assert options.keyframes is True
     assert options.gpu_scale is False

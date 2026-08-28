@@ -130,6 +130,7 @@ OPTION_CONTROLS = {
     "lut": "_lut",
     "lut_all": "_lut_all",
     "normalise_strength": "_normalise",
+    "lut_strength": "_lut_strength",
     "look": "_look",
     "look_strength": "_look_strength",
     "jobs": "_jobs",
@@ -266,6 +267,18 @@ class DropWindow(QWidget):
         lut_row.addWidget(self._lut_all)
         form.addRow(S.GUI_LUT, lut_row)
         form.addRow("", self._hint(S.GUI_LUT_HINT))
+
+        self._lut_auto = QCheckBox(S.GUI_LUT_STRENGTH_AUTO)
+        self._lut_auto.setChecked(True)
+        self._lut_strength = self._spin(0.0, 1.0, 0.05, 1.0)
+        self._lut_strength.setEnabled(False)
+        self._lut_auto.toggled.connect(lambda on: self._lut_strength.setEnabled(not on))
+        strength_row = QHBoxLayout()
+        strength_row.addWidget(self._lut_auto)
+        strength_row.addWidget(self._lut_strength)
+        strength_row.addStretch(1)
+        form.addRow(S.GUI_LUT_STRENGTH, strength_row)
+        form.addRow("", self._hint(S.GUI_LUT_STRENGTH_HINT))
 
         self._profile = self._combo(PROFILE_CHOICES)
         form.addRow(S.GUI_PROFILE, self._profile)
@@ -541,6 +554,7 @@ class DropWindow(QWidget):
             lut=self._lut.text() or None,
             lut_all=self._lut_all.isChecked(),
             normalise_strength=self._normalise.value(),
+            lut_strength=None if self._lut_auto.isChecked() else self._lut_strength.value(),
             look=LOOK_CHOICES[self._look.currentIndex()][1],
             look_strength=self._look_strength.value(),
             jobs=self._jobs.value(),

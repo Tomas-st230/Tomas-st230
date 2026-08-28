@@ -56,7 +56,7 @@ python -m venv .venv
 
 python -m pip install -e ".[gui,dev]"     # CLI + drag-and-drop window + tests
 python -m pip install -e .                # CLI only
-python -m pytest -q                        # 178 tests, all should pass
+python -m pytest -q                        # 192 tests, all should pass
 ```
 
 `ffmpeg` and `ffprobe` must be on `PATH`. Nothing else shells out: every
@@ -75,7 +75,7 @@ git pull origin claude/best-frame-picker-tool-e25ekc
 
 cd frame-picker
 python -m pip install -e ".[gui,dev]"    # re-run after every pull; it is quick when nothing changed
-python -m pytest -q                       # 179 tests; if any fail, stop and send the output
+python -m pytest -q                       # 192 tests; if any fail, stop and send the output
 python -m gui.drop_window
 ```
 
@@ -230,6 +230,7 @@ timestamps you can see that rather than wonder.
 | `--convert-log` | `auto` | `auto` uses metadata then filename hints; `on`/`off` force it |
 | `--lut` | – | `.cube` applied **only to clips detected as log**, for analysis *and* for the exported image |
 | `--lut-all` | off | force `--lut` onto every clip, log or not |
+| `--lut-strength` | `auto` | how much of the LUT to apply; `auto` measures each clip and keeps the strongest setting that does not overshoot |
 | `--normalise-strength` | `1.0` | strength of the no-LUT log fallback; `0` turns it off |
 | `--look` | `none` | look for the exported stills: `auto`, `nature`, `city`, `none` |
 | `--look-strength` | `0.6` | how far toward the look's targets to travel |
@@ -546,6 +547,60 @@ evidence in the message, and `--convert-log off` overrides it. If the clip is
 actually HLG rather than D-Log, a D-Log LUT is the wrong conversion — so when
 the profile is known to be HLG and a LUT is applied, the report says exactly
 that instead of quietly grading it.
+
+### The conversion has to prove itself
+
+A LUT is applied on a claim: *this footage is flat, and the LUT makes it
+normal.* The claim is now **measured**, per clip, before the export is written.
+
+The same twelve frames are decoded twice - untouched, and through the LUT - and
+compared. The conversion is refused if it:
+
+| measurement | limit |
+|---|---|
+| mean saturation afterwards (when the conversion is what raised it) | > 0.55 |
+| saturation multiplied by | > 1.45x |
+| newly blown highlights | > 5 % of the frame |
+| newly crushed blacks | > 4 % of the frame |
+| luma span kept | < 90 % of what went in |
+
+Those limits come from Tomas's own files and his own cube. At full strength it
+took mean saturation **0.210 → 0.384** and pushed **12 % of every frame to
+black** (0.005 → 0.122), while the luma span barely moved (0.628 → 0.653) -
+a conversion that is not opening the picture up, only crushing it. That is what
+"too much of everything" was.
+
+**Refusing is not the only answer.** A cube file has no dial inside it, so
+"convert, but less" means blending the converted image back over the original -
+`split`/`lut3d`/`blend` in one filtergraph, in the analysis *and* in the export,
+so what was measured is what gets written. `--lut-strength auto` (the default)
+walks 1.0 → 0.75 → 0.5 → 0.25 and keeps the strongest rung that passes the
+check; if even the weakest overshoots, no LUT is applied and the original is
+kept. Measured on the same clip:
+
+| strength | saturation | luma span | black pixels |
+|---|---|---|---|
+| 0.00 (untouched) | 0.208 | 0.628 | 0.5 % |
+| 0.25 | 0.242 | 0.634 | 1.2 % |
+| 0.50 | 0.278 | 0.640 | 2.9 % |
+| 0.75 | 0.327 | 0.646 | 6.7 % |
+| 1.00 | 0.384 | 0.653 | 12.2 % |
+
+The whole ladder costs **one** extra decode: the blend is linear, so every rung
+is computed from the two decoded sets in memory and only the chosen strength is
+re-applied by ffmpeg. The run says which rung it landed on and why:
+
+```
+LUT pritaikytas tik 50 % stiprumu — pilnas buvo per stiprus šiai medžiagai
+(sodrumas 0.208 → 0.278). Stiprumą galima nurodyti ranka: --lut-strength 0..1.
+
+LUT ATŠAUKTAS šiam failui: konvertavimas užgniaužė šešėlius (sodrumas 0.208 →
+0.451). Originalas jau atrodo teisingai, todėl paliekamas nekeistas.
+```
+
+`--convert-log on` and `--lut-all` are you overruling the measurement: the LUT
+is then applied whatever the check says, and the check's objection is printed
+instead of acted on. `--lut-strength 0.4` fixes a number and skips the ladder.
 
 **Measured flatness stays evidence, not a trigger.** Across those 163 files the
 luma span ran 0.155–0.925 and mean saturation 0.074–0.765 in one continuous
@@ -916,6 +971,13 @@ Enforced rules, each one a defect that already cost time:
 * `test_symmetry_is_measured_against_the_frames_own_contrast` and
   `test_repetition_finds_stripes_and_ignores_gradients` — the two new graphic
   measurements cannot be fooled by a flat frame or a sky gradient.
+* `test_a_lut_that_overshoots_is_refused_and_the_original_kept` and
+  `test_a_lut_that_is_only_a_little_strong_is_softened_not_dropped` — a
+  conversion that makes the picture worse is measured, softened, or dropped;
+  forcing it keeps it *and* prints the objection.
+* `test_footage_that_arrives_colourful_is_not_blamed_on_the_conversion` — the
+  saturation ceiling is about what the conversion added, not what the source
+  already was.
 * `test_a_handful_of_picks_proposes_nothing` and
   `test_no_weight_is_ever_deleted_or_allowed_to_take_over` — calibration
   refuses to be confident.
