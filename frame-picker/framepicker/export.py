@@ -13,6 +13,7 @@ from dataclasses import dataclass
 
 from . import proc
 from . import strings_lt as S
+from . import grading
 from .decode import Normalisation, escape_filter_path
 
 FFMPEG = "ffmpeg"
@@ -68,6 +69,8 @@ def export_frame(
     quality: int = 2,
     image_format: str = "jpg",
     height: int = 0,
+    look: grading.Look | None = None,
+    look_strength: float = grading.DEFAULT_STRENGTH,
 ) -> ExportResult:
     """Cut one frame out of *src* at *timestamp* and write it to *out_path*.
 
@@ -100,17 +103,29 @@ def export_frame(
     if not result.ok or not os.path.isfile(out_path):
         return ExportResult(out_path, timestamp, False, result.stderr_text() or f"exit {result.returncode}")
 
-    if normalisation is not None:
-        applied = _apply_normalisation_in_place(out_path, normalisation, quality, image_format)
+    if normalisation is not None or look is not None:
+        applied = _post_process_in_place(
+            out_path, normalisation, look, look_strength, quality, image_format
+        )
         if applied is not None:
             return ExportResult(out_path, timestamp, False, applied)
     return ExportResult(out_path, timestamp, True)
 
 
-def _apply_normalisation_in_place(
-    path: str, normalisation: Normalisation, quality: int, image_format: str
+def _post_process_in_place(
+    path: str,
+    normalisation: Normalisation | None,
+    look: grading.Look | None,
+    look_strength: float,
+    quality: int,
+    image_format: str,
 ) -> str | None:
-    """Re-write *path* with the analysis transform applied. Returns an error or None."""
+    """Re-write *path* with the colour conversion and/or the look applied.
+
+    Order matters: the conversion (LUT fallback) is a correction and comes
+    first; the look is a taste decision and comes last, on top of a corrected
+    image.
+    """
     import cv2
     import numpy as np
 
@@ -118,8 +133,11 @@ def _apply_normalisation_in_place(
     if image is None:
         return "written file could not be re-read"
     rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    converted = normalisation.apply(rgb)
-    bgr = cv2.cvtColor(np.ascontiguousarray(converted), cv2.COLOR_RGB2BGR)
+    if normalisation is not None:
+        rgb = normalisation.apply(rgb)
+    if look is not None:
+        rgb, _info = grading.apply_look(rgb, look, look_strength)
+    bgr = cv2.cvtColor(np.ascontiguousarray(rgb), cv2.COLOR_RGB2BGR)
     if image_format.lower() in ("jpg", "jpeg"):
         # ffmpeg -q:v 2 is roughly JPEG quality 90-95; keep the rewrite close.
         params = [cv2.IMWRITE_JPEG_QUALITY, 95]
@@ -141,6 +159,8 @@ def export_selection(
     quality: int = 2,
     image_format: str = "jpg",
     height: int = 0,
+    look: grading.Look | None = None,
+    look_strength: float = grading.DEFAULT_STRENGTH,
     cancel=None,
 ) -> tuple[list[ExportResult], list[str]]:
     """Export every chosen candidate. Returns ``(results, error_messages)``."""
@@ -159,6 +179,8 @@ def export_selection(
             quality=quality,
             image_format=image_format,
             height=height,
+            look=look,
+            look_strength=look_strength,
         )
         results.append(result)
         if not result.ok:

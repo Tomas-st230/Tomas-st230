@@ -28,9 +28,10 @@ from typing import Iterable, Sequence
 from . import strings_lt as S
 
 WEIGHTS = {          # starting values - NOT measured, to be calibrated on
-    "content":     0.55,   # Tomas's own footage before anyone trusts them
-    "technical":   0.30,
+    "content":     0.50,   # Tomas's own footage before anyone trusts them
+    "technical":   0.25,
     "composition": 0.15,
+    "moment":      0.10,   # is this a moving shot, and is anyone in it
 }
 
 # -- content ---------------------------------------------------------------
@@ -56,6 +57,25 @@ CLIP_HIGH_SHARE = 0.6
 CLIP_LOW_SHARE = 0.4
 #: How much of the technical term clipping can eat.
 CLIP_MAX_PENALTY = 0.8
+
+# -- moment ----------------------------------------------------------------
+#: A locked-off shot and an orbit are different kinds of frame. Motion is
+#: measured between consecutive samples, ranked within the clip, and only
+#: counts as a "moment" together with what is in the frame: a moving shot with
+#: a person in it is the thing being looked for, a moving shot of nothing is
+#: worth a little, and a static shot is worth none of this term.
+MOTION_WITHOUT_PEOPLE = 0.45
+MOTION_WITH_PEOPLE = 1.0
+
+# -- horizon ---------------------------------------------------------------
+#: How much of the technical term a fully crooked horizon can eat. A tilted
+#: horizon is the one composition defect in drone footage that is unambiguous.
+TILT_MAX_PENALTY = 0.25
+
+# -- composition -----------------------------------------------------------
+#: Share of the composition term carried by how cleanly the subject separates
+#: from its surroundings; the rest is the rule-of-thirds placement.
+SEPARATION_SHARE = 0.25
 
 # -- confidence (TRAP-11) --------------------------------------------------
 #: Number of top candidates whose spread decides whether the ranking is
@@ -92,12 +112,35 @@ def clipping_penalty(clip_low: float, clip_high: float) -> float:
     return _clamp01(CLIP_HIGH_SHARE * high + CLIP_LOW_SHARE * low)
 
 
-def technical_component(sharpness_rank: float, clip_low: float, clip_high: float) -> float:
-    """Sharpness as a gate, reduced by clipping."""
+def technical_component(
+    sharpness_rank: float, clip_low: float, clip_high: float, horizon_tilt: float | None = None
+) -> float:
+    """Sharpness as a gate, reduced by clipping and by a crooked horizon."""
     sharp = TECHNICAL_FLOOR + (1.0 - TECHNICAL_FLOOR) * _clamp01(
         _clamp01(sharpness_rank) / SHARPNESS_SATURATION
     )
-    return _clamp01(sharp * (1.0 - CLIP_MAX_PENALTY * clipping_penalty(clip_low, clip_high)))
+    value = sharp * (1.0 - CLIP_MAX_PENALTY * clipping_penalty(clip_low, clip_high))
+    if horizon_tilt is not None:
+        value *= 1.0 - TILT_MAX_PENALTY * _clamp01(horizon_tilt)
+    return _clamp01(value)
+
+
+def moment_component(motion_rank: float | None, face_present: bool | None) -> float | None:
+    """Is this a moving shot, and is anyone in it? ``None`` if motion is unknown."""
+    if motion_rank is None:
+        return None
+    weight = MOTION_WITH_PEOPLE if face_present else MOTION_WITHOUT_PEOPLE
+    return _clamp01(_clamp01(motion_rank) * weight)
+
+
+def composition_from(thirds_dist: float | None, separation: float | None) -> float | None:
+    """Thirds placement, plus how cleanly the subject stands out."""
+    if thirds_dist is None:
+        return None
+    placement = _clamp01(1.0 - _clamp01(thirds_dist))
+    if separation is None:
+        return placement
+    return _clamp01((1.0 - SEPARATION_SHARE) * placement + SEPARATION_SHARE * _clamp01(separation))
 
 
 def composition_component(thirds_dist: float | None) -> float | None:
@@ -127,12 +170,18 @@ def score_frame_explained(features: dict) -> tuple[float, list[str]]:
     land_term = landscape_component(color_rank, range_rank)
     content = land_term if face_term is None else max(face_term, land_term)
 
-    technical = technical_component(sharp_rank, clip_low, clip_high)
-    composition = composition_component(features.get("thirds_distance"))
+    technical = technical_component(sharp_rank, clip_low, clip_high, features.get("horizon_tilt"))
+    composition = composition_from(features.get("thirds_distance"), features.get("subject_separation"))
+    moment = moment_component(
+        features.get("motion_rank"),
+        bool(features.get("face_max_rel") or 0.0) if faces_known else None,
+    )
 
     parts = {"content": content, "technical": technical}
     if composition is not None:
         parts["composition"] = composition
+    if moment is not None:
+        parts["moment"] = moment
     total_weight = sum(WEIGHTS[k] for k in parts)
     score = sum(WEIGHTS[k] * v for k, v in parts.items()) / total_weight
 
@@ -154,17 +203,26 @@ def score_frame_explained(features: dict) -> tuple[float, list[str]]:
         reasons.append(S.reason_clipped_high(clip_high))
     if clip_low > 0.02:
         reasons.append(S.reason_clipped_low(clip_low))
+    tilt = features.get("horizon_tilt")
+    if tilt is not None and tilt > 0.15:
+        reasons.append(S.reason_horizon_tilt(float(tilt) * S.TILT_FULL_DEGREES_FOR_TEXT))
     if composition is None:
         reasons.append(S.reason_composition_unknown())
     else:
         reasons.append(S.reason_thirds(float(features["thirds_distance"])))
         if features.get("subject_rel") is not None:
             reasons.append(S.reason_subject_size(float(features["subject_rel"])))
+        if features.get("subject_separation") is not None:
+            reasons.append(S.reason_subject_separation(float(features["subject_separation"])))
+    if moment is not None:
+        reasons.append(S.reason_motion(float(features.get("motion_rank") or 0.0) * 100.0))
 
     reasons.append(S.reason_component(S.COMPONENT_CONTENT, content))
     reasons.append(S.reason_component(S.COMPONENT_TECHNICAL, technical))
     if composition is not None:
         reasons.append(S.reason_component(S.COMPONENT_COMPOSITION, composition))
+    if moment is not None:
+        reasons.append(S.reason_component(S.COMPONENT_MOMENT, moment))
 
     return _clamp01(score), reasons
 
@@ -200,8 +258,12 @@ def attach_ranks(feature_dicts: Iterable[dict]) -> list[dict]:
     items = list(feature_dicts)
     if not items:
         return items
-    for key in ("sharpness", "dynamic_range", "colorfulness"):
+    for key in ("sharpness", "dynamic_range", "colorfulness", "motion"):
+        if all(item.get(key) is None for item in items):
+            continue
         ranks = percentile_ranks([float(item.get(key) or 0.0) for item in items])
         for item, rank in zip(items, ranks):
-            item[f"{key}_rank"] = rank
+            # A frame with no measurement keeps None: the first frame of a clip
+            # has no motion to speak of, and that is not "no motion".
+            item[f"{key}_rank"] = None if item.get(key) is None else rank
     return items

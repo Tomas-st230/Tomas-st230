@@ -51,7 +51,10 @@ FEATURE_KEYS = (
     "subject_rel",
     "subject_cx",
     "subject_cy",
+    "subject_separation",
     "thirds_distance",
+    "horizon_tilt",
+    "motion",
 )
 
 
@@ -134,6 +137,119 @@ def thirds_distance(cx: float, cy: float) -> float:
     """
     best = min(float(np.hypot(cx - px, cy - py)) for px, py in THIRDS_POINTS)
     return float(min(1.0, best / MAX_THIRDS_DISTANCE))
+
+
+def motion(previous: np.ndarray | None, current: np.ndarray) -> float | None:
+    """How much the frame moved since the previous sample, 0..1.
+
+    Mean absolute luma difference between two consecutive sampled frames. At
+    the default 2 samples per second this reads the *shot*: a locked-off shot
+    sits near zero, an orbit or a pull-back reads high. ``None`` for the first
+    frame of a clip, which has nothing to compare against - and ``None`` is
+    not zero.
+    """
+    if previous is None:
+        return None
+    a = to_luma(previous)
+    b = to_luma(current)
+    if a.shape != b.shape:
+        return None
+    return float(np.abs(a - b).mean() / 255.0)
+
+
+#: Angle, in degrees from horizontal, at which a tilted horizon counts as
+#: fully wrong. Beyond this the penalty stops growing.
+TILT_FULL_DEGREES = 8.0
+#: Only lines within this many degrees of horizontal are candidate horizons.
+TILT_SEARCH_DEGREES = 30.0
+#: If the strongest candidate lines disagree by more than this, the frame has
+#: no horizon and the measurement is withheld rather than invented.
+TILT_MAX_SPREAD_DEGREES = 3.0
+#: ...and they must sit at the same height, within this fraction of the frame.
+TILT_MAX_SPREAD_ROWS = 0.06
+#: ...and the two sides of the line must differ in brightness by at least this
+#: much (0..1). A horizon separates sky from ground; random texture does not,
+#: and without this check uniform noise reports a perfectly level horizon.
+TILT_MIN_CONTRAST = 0.05
+
+
+def horizon_tilt(frame: np.ndarray) -> float | None:
+    """How far off level the dominant near-horizontal line is, 0..1.
+
+    A crooked horizon is the one composition defect in drone footage that is
+    both unambiguous and cheap to measure, so it is measured rather than
+    guessed. ``None`` when the frame has no near-horizontal line long enough
+    to judge - a top-down shot, for instance - because "no horizon" is not the
+    same as "a level one", and a missing measurement must never score as a
+    good one.
+    """
+    import cv2
+
+    luma = to_luma(frame).astype(np.uint8)
+    blurred = cv2.GaussianBlur(luma, (5, 5), 0)
+    # Thresholds from the frame's own brightness: a fixed pair misses the
+    # horizon in hazy or backlit footage, which is most of a sunset clip.
+    median = float(np.median(blurred))
+    low = int(max(10.0, 0.66 * median))
+    high = int(min(255.0, max(low + 10.0, 1.33 * median)))
+    edges = cv2.Canny(blurred, low, high)
+
+    height, width = edges.shape[:2]
+    lines = cv2.HoughLinesP(
+        edges, 1, np.pi / 360.0,
+        threshold=50,
+        minLineLength=int(width * 0.35),
+        maxLineGap=max(2, int(width * 0.03)),
+    )
+    if lines is None or len(lines) == 0:
+        return None
+
+    angles: list[float] = []
+    weights: list[float] = []
+    mid_y: list[float] = []
+    for entry in lines:
+        # OpenCV has returned both (N, 1, 4) and (N, 4) over the years.
+        values = np.asarray(entry, dtype=np.float64).ravel()
+        if values.size < 4:
+            continue
+        x1, y1, x2, y2 = values[:4]
+        length = float(np.hypot(x2 - x1, y2 - y1))
+        if length <= 0:
+            continue
+        angle = float(np.degrees(np.arctan2(y2 - y1, x2 - x1)))
+        if angle > 90:
+            angle -= 180
+        elif angle < -90:
+            angle += 180
+        if abs(angle) <= TILT_SEARCH_DEGREES:
+            angles.append(abs(angle))
+            weights.append(length)
+            mid_y.append((y1 + y2) / 2.0)
+    if not angles:
+        return None
+    order = np.argsort(np.asarray(weights))[::-1][:8]   # the longest lines decide
+    chosen = np.asarray(angles)[order]
+    chosen_y = np.asarray(mid_y)[order]
+    dominant = float(np.median(chosen))
+
+    # A textured frame - forest canopy, choppy water, sensor noise - throws up
+    # plenty of long "lines". Two things separate those from a horizon: the
+    # candidates must agree on an angle, and they must sit at the same height
+    # in the frame, because a horizon is one line and not a field of them.
+    if float(np.median(np.abs(chosen - dominant))) > TILT_MAX_SPREAD_DEGREES:
+        return None
+    row = float(np.median(chosen_y))
+    if float(np.median(np.abs(chosen_y - row))) > TILT_MAX_SPREAD_ROWS * height:
+        return None
+
+    # A horizon has something different on each side of it. Texture does not.
+    split = int(round(min(max(row, 1.0), height - 2.0)))
+    above = float(luma[:split].mean())
+    below = float(luma[split:].mean())
+    if abs(above - below) / 255.0 < TILT_MIN_CONTRAST:
+        return None
+
+    return float(min(1.0, dominant / TILT_FULL_DEGREES))
 
 
 def percentile_ranks(values: Sequence[float]) -> list[float]:
@@ -271,8 +387,13 @@ class SaliencyBackend:
 
         self._impl = cv2.saliency.StaticSaliencySpectralResidual_create()
 
-    def subject(self, frame: np.ndarray) -> tuple[float, float, float] | None:
-        """Return ``(area_fraction, cx, cy)`` of the largest salient blob."""
+    def subject(self, frame: np.ndarray) -> tuple[float, float, float, float] | None:
+        """Return ``(area_fraction, cx, cy, separation)`` of the largest salient blob.
+
+        ``separation`` is how much more salient the blob is than the rest of
+        the frame, 0..1 - a clean subject against calm surroundings scores
+        high, a busy frame with nothing dominant scores low.
+        """
         import cv2
 
         arr = np.ascontiguousarray(np.asarray(frame, dtype=np.uint8))
@@ -292,7 +413,15 @@ class SaliencyBackend:
         area_fraction = float(stats[biggest, cv2.CC_STAT_AREA]) / float(width * height)
         cx = float(centroids[biggest][0]) / float(width)
         cy = float(centroids[biggest][1]) / float(height)
-        return area_fraction, cx, cy
+
+        inside = labels == biggest
+        outside = ~inside
+        if inside.any() and outside.any():
+            gap = float(scaled[inside].mean() - scaled[outside].mean()) / 255.0
+            separation = float(min(1.0, max(0.0, gap * 2.0)))
+        else:
+            separation = 0.0
+        return area_fraction, cx, cy, separation
 
 
 def load_saliency(enabled: bool = True) -> tuple[SaliencyBackend | None, DetectorStatus]:
@@ -328,7 +457,10 @@ def extract(
         "subject_rel": None,
         "subject_cx": None,
         "subject_cy": None,
+        "subject_separation": None,
         "thirds_distance": None,
+        "horizon_tilt": None,
+        "motion": None,
     }
     if face_detector is not None:
         count, max_rel = face_detector.detect(frame)
@@ -337,9 +469,11 @@ def extract(
     if saliency is not None:
         subject = saliency.subject(frame)
         if subject is not None:
-            rel, cx, cy = subject
+            rel, cx, cy, separation = subject
             result["subject_rel"] = rel
             result["subject_cx"] = cx
             result["subject_cy"] = cy
+            result["subject_separation"] = separation
             result["thirds_distance"] = thirds_distance(cx, cy)
+    result["horizon_tilt"] = horizon_tilt(frame)
     return result

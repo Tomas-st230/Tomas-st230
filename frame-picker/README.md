@@ -27,13 +27,18 @@ Read this before trusting any output.
   report says that on every clip where it is used.
 * **Log detection is a guess** unless you force it with `--convert-log`. The
   guess, and what it was based on, is printed and written to `results.json`.
-* **The flatness thresholds that detect log footage are unverified.**
-  `LOG_STATS_MAX_LUMA_SPAN = 0.55` and `LOG_STATS_MAX_SATURATION = 0.22` separate
-  the synthetic fixtures cleanly (flat: 0.17 / 0.19, normal: 0.73–0.81 /
-  0.73–0.95) but have never been checked against real D-Log M footage. Every run
-  writes the measured `luma_span` and `saturation` of every clip into
-  `results.json` under `log.statistics` — send those numbers from your own files
-  and the thresholds can be set from data instead of guessed.
+* **Measured flatness does not detect log footage, and no longer pretends to.**
+  Checked against 77 real DJI clips from one card — all the same picture profile
+  — `luma_span` ran 0.155–0.925 and mean saturation 0.074–0.765 in one
+  continuous distribution with no bimodal gap anywhere a threshold could sit.
+  The measurement was reading the *scene*, not the profile: four dark sunset
+  clips fell under the limits, had their saturation multiplied by 2.5, and came
+  out neon. Flatness is now reported as a **suspicion only** and never triggers
+  a transform; `--convert-log on` is how you act on it.
+* **The looks, the weights and the thresholds are all chosen, not measured.**
+  `--look nature` / `--look city` are parametric targets picked by argument. So
+  are the four scoring weights and `--min-score`. Every one of them is printed
+  into `results.json` and labelled in the report.
 * **Cross-clip comparison is weaker than the per-clip ranking.** Sharpness,
   dynamic range and colourfulness are converted to percentile ranks *inside a
   clip* before scoring, because absolute thresholds are wrong across cameras,
@@ -154,6 +159,9 @@ timestamps you can see that rather than wonder.
 | `--convert-log` | `auto` | `auto` uses metadata then filename hints; `on`/`off` force it |
 | `--lut` | – | `.cube` applied **only to clips detected as log**, for analysis *and* for the exported image |
 | `--lut-all` | off | force `--lut` onto every clip, log or not |
+| `--normalise-strength` | `1.0` | strength of the no-LUT log fallback; `0` turns it off |
+| `--look` | `none` | named look for the exported stills: `nature`, `city`, `none` |
+| `--look-strength` | `0.6` | how far toward the look's targets to travel |
 | `--jobs` | auto | files processed in parallel (auto = `min(4, cpu_count)`) |
 | `--no-faces` | off | skip face detection entirely |
 | `--face-model` | – | explicit path to a YuNet `.onnx` |
@@ -198,6 +206,25 @@ frame-picker-out/
   report.html                        # self-contained, images inlined
 ```
 
+### End-of-run check
+
+Before the report is written, every preview is built and the whole output is
+verified: each frame the report claims is on disk, non-empty, and has its
+preview embedded. Failed exports, unreadable files and unreferenced leftovers
+are all listed by name. The verdict prints to the console, appears at the top of
+`report.html`, and lands in `results.json` under `integrity`. A frame whose
+preview could not be produced renders a stated finding rather than a blank gap —
+which is what the first large run did, silently.
+
+### While it runs
+
+The machine is asked not to fall asleep on its own for the duration of the
+batch (Windows: `ES_CONTINUOUS | ES_SYSTEM_REQUIRED`, released on the way out,
+including on cancel and on exception). `ES_DISPLAY_REQUIRED` is deliberately
+**not** set and a test asserts it stays that way: the screen still goes dark,
+the machine still locks, and shutdown, restart, log-off and manual sleep all
+keep working exactly as before. On other platforms it is a no-op that says so.
+
 `results.json` per clip: probe data, the log verdict and what it was based on,
 the colour transform used, the decode path (`hw`/`cpu`) and why, candidates
 evaluated, rejects broken down by cause, the confidence verdict, the selection
@@ -220,10 +247,26 @@ full-quality re-grab can be redone later.
 `framepicker/scoring.py`, one dict, one place:
 
 ```python
-WEIGHTS = {"content": 0.55, "technical": 0.30, "composition": 0.15}
+WEIGHTS = {"content": 0.50, "technical": 0.25, "composition": 0.15, "moment": 0.10}
 ```
 
 `content = max(face_component, landscape_component)`
+
+`moment` answers "is this a moving shot, and is anyone in it": motion is the
+mean luma change between consecutive samples, ranked within the clip, and it
+counts for more when a face is present than when the frame is empty. A
+locked-off shot scores none of this term. The first frame of a clip has no
+previous frame, so its motion is `None` — dropped, not zero.
+
+`technical` also carries a **horizon tilt** penalty. A crooked horizon is the
+one composition defect in drone footage that is unambiguous and cheap to
+measure, so it is measured: the dominant near-horizontal line's angle, withheld
+as `None` unless the candidate lines agree on an angle, sit at the same height,
+and have genuinely different brightness on each side — otherwise choppy water
+and forest canopy report a perfectly level horizon that is not there.
+
+`composition` blends the rule-of-thirds placement with **subject separation**:
+how much more salient the main blob is than everything around it.
 
 Four principles, stated so they can be argued with:
 
@@ -275,6 +318,30 @@ Aptiktas plokščias (log) profilis. Pagrindas: išmatuotas kadrų plokštumas
 Išmatuota iš kadrų: šviesumo diapazonas 0.412, sodrumas 0.155
 Analizei pritaikytas LUT: D:\LUT\DJI_DLogM_to_Rec709.cube
 ```
+
+### Looks
+
+`--look nature` and `--look city` grade the **exported stills only** — never the
+analysis frames, because scores have to stay comparable between clips and a look
+is a taste decision while a score is meant to be a measurement.
+
+A look is not a curve pasted on top. Each preset is a set of *targets* (a
+saturation, a contrast span, a warmth tilt, a shadow lift, a highlight
+rolloff), and each frame is measured first and then moved `--look-strength` of
+the way toward them. A frame that is already rich is barely touched; a flat one
+is lifted. Measured on the same source frame at strength 0.6:
+
+| Look | luma span | mean saturation |
+|---|---|---|
+| none | 0.18 | 0.19 |
+| nature | 0.30 | 0.37 |
+| city | 0.28 | 0.30 |
+
+Three bounds exist because the unbounded version of this already broke real
+exports: the contrast stretch is capped at 1.6×, the saturation multiplier at
+1.45×, and the highlight rolloff is asymptotic so a bright sky keeps its
+gradation instead of becoming one flat white shape. Without the contrast cap a
+foggy frame asks for a 140× stretch and its last trace of colour explodes.
 
 ### Confidence
 

@@ -38,7 +38,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from framepicker import strings_lt as S
+from framepicker import grading, strings_lt as S
 from framepicker.cli import (
     DEFAULT_MAX_PER_CLIP,
     DEFAULT_MIN_SCORE,
@@ -73,6 +73,8 @@ PROFILE_CHOICES = (
     (S.GUI_PROFILE_ON, "on"),
     (S.GUI_PROFILE_OFF, "off"),
 )
+#: Look names as offered by framepicker, paired with their Lithuanian labels.
+LOOK_CHOICES = tuple((S.LOOK_NAMES.get(name, name), name) for name in grading.available())
 
 
 class _Worker(QObject):
@@ -163,6 +165,20 @@ class DropWindow(QWidget):
         for label, _value in PROFILE_CHOICES:
             self._profile.addItem(label)
         form.addRow(S.GUI_PROFILE, self._profile)
+
+        self._look = QComboBox()
+        for label, _value in LOOK_CHOICES:
+            self._look.addItem(label)
+        self._look_strength = QDoubleSpinBox()
+        self._look_strength.setRange(0.0, 1.0)
+        self._look_strength.setSingleStep(0.1)
+        self._look_strength.setDecimals(2)
+        self._look_strength.setValue(grading.DEFAULT_STRENGTH)
+        look_row = QHBoxLayout()
+        look_row.addWidget(self._look, stretch=1)
+        look_row.addWidget(QLabel(S.GUI_LOOK_STRENGTH))
+        look_row.addWidget(self._look_strength)
+        form.addRow(S.GUI_LOOK, look_row)
 
         self._min_score = QDoubleSpinBox()
         self._min_score.setRange(0.0, 1.0)
@@ -275,6 +291,8 @@ class DropWindow(QWidget):
             min_score=self._min_score.value(),
             max_per_clip=self._max_per_clip.value(),
             order=self._order,
+            look=LOOK_CHOICES[self._look.currentIndex()][1],
+            look_strength=self._look_strength.value(),
         )
 
     # -- run ---------------------------------------------------------------

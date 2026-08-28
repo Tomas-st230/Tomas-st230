@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, Sequence
 
-from . import decode, export, features, keepawake, proc, report, scoring
+from . import decode, export, features, grading, keepawake, proc, report, scoring
 from . import strings_lt as S
 from .probe import ProbeError, probe
 from .select import (
@@ -74,6 +74,8 @@ class Options:
     lut: str | None = None
     lut_all: bool = False
     normalise_strength: float = 1.0
+    look: str = grading.NONE
+    look_strength: float = grading.DEFAULT_STRENGTH
     jobs: int = 0
     no_faces: bool = False
     face_model: str | None = None
@@ -98,6 +100,8 @@ class Options:
             "lut": self.lut,
             "lut_all": self.lut_all,
             "normalise_strength": self.normalise_strength,
+            "look": self.look,
+            "look_strength": self.look_strength,
             "jobs": self.jobs,
             "no_faces": self.no_faces,
             "image_format": self.image_format,
@@ -308,6 +312,7 @@ def analyse_clip(
     buffers: list[bytes] = []
     timestamps: list[float] = []
     cheap: list[dict] = []
+    previous_frame = None
     for timestamp, frame in decode.sample_frames(
         clip,
         options.fps,
@@ -326,6 +331,7 @@ def analyse_clip(
         buffers.append(blob)
         timestamps.append(timestamp)
         cheap.append({
+            "motion": features.motion(previous_frame, work),
             "sharpness": features.sharpness(work),
             "exposure_clip_low": features.exposure_clip_low(work),
             "exposure_clip_high": features.exposure_clip_high(work),
@@ -333,6 +339,7 @@ def analyse_clip(
             "colorfulness": features.colorfulness(work),
             "saturation_mean": features.saturation_mean(work),
         })
+        previous_frame = work
     record["decode"] = decode_report.as_dict()
     messenger.say(S.decode_path_hw() if decode_report.path_used == "hw"
                   else S.decode_path_cpu(decode_report.hw_error))
@@ -386,12 +393,15 @@ def analyse_clip(
             item["face_count"] = None
             item["face_max_rel"] = None
         item["subject_rel"] = item["subject_cx"] = item["subject_cy"] = item["thirds_distance"] = None
+        item["subject_separation"] = None
         if saliency is not None:
             subject = saliency.subject(frame)
             if subject is not None:
-                rel, cx, cy = subject
+                rel, cx, cy, separation = subject
                 item["subject_rel"], item["subject_cx"], item["subject_cy"] = rel, cx, cy
+                item["subject_separation"] = separation
                 item["thirds_distance"] = features.thirds_distance(cx, cy)
+        item["horizon_tilt"] = features.horizon_tilt(frame)
         score, reasons = scoring.score_frame_explained(item)
         candidates.append(Candidate(
             index=i,
@@ -438,12 +448,19 @@ def analyse_clip(
             quality=options.jpeg_quality,
             image_format=options.image_format,
             height=options.export_height,
+            look=grading.get(options.look),
+            look_strength=options.look_strength,
             cancel=cancel,
         )
         record["notes"].append(
             S.export_resolution_scaled(options.export_height) if options.export_height
             else S.export_resolution_native()
         )
+        look = grading.get(options.look)
+        record["look"] = {"name": options.look, "strength": options.look_strength,
+                          "definition": look.as_dict() if look else None}
+        _note(record, messenger, S.look_applied(options.look, options.look_strength)
+              if look else S.look_none())
         for text in errors:
             messenger.say(text)
         for rank, (candidate, result) in enumerate(zip(selection.selected, results), start=1):
@@ -774,6 +791,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="apply --lut to every clip, log or not (wrecks Rec.709 footage)")
     parser.add_argument("--normalise-strength", type=float, default=1.0,
                         help="strength of the no-LUT log fallback, 0 = off, 1 = full")
+    parser.add_argument("--look", choices=grading.available(), default=grading.NONE,
+                        help="named look for the exported stills: 'nature', 'city' or 'none'")
+    parser.add_argument("--look-strength", type=float, default=grading.DEFAULT_STRENGTH,
+                        help="how far toward the look's targets to travel, 0 = off, 1 = full")
     parser.add_argument("--jobs", type=int, default=0, help="files processed in parallel (0 = auto)")
     parser.add_argument("--no-faces", action="store_true", help="skip face detection entirely")
     parser.add_argument("--face-model", default=None, help="explicit path to a YuNet .onnx model")
@@ -803,6 +824,8 @@ def options_from_args(args: argparse.Namespace) -> Options:
         lut=args.lut,
         lut_all=args.lut_all,
         normalise_strength=args.normalise_strength,
+        look=args.look,
+        look_strength=args.look_strength,
         jobs=args.jobs,
         no_faces=args.no_faces,
         face_model=args.face_model,

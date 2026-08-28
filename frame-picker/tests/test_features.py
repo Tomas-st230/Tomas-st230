@@ -119,3 +119,47 @@ def test_yunet_filenames_are_the_ones_published_by_opencv_zoo():
     """Checked against the repository, not guessed (task section 12)."""
     assert "face_detection_yunet_2023mar.onnx" in features.YUNET_FILENAMES
     assert all(name.endswith(".onnx") for name in features.YUNET_FILENAMES)
+
+
+# --------------------------------------------------------------------------
+# Motion, horizon tilt, subject separation
+# --------------------------------------------------------------------------
+
+
+def _horizon(degrees: float, width: int = 640, height: int = 360) -> np.ndarray:
+    """A bright sky over dark land, tilted by *degrees*."""
+    image = np.zeros((height, width, 3), dtype=np.uint8)
+    image[:, :] = (60, 130, 210)
+    for x in range(width):
+        y = int(height / 2 + np.tan(np.radians(degrees)) * (x - width / 2))
+        image[max(0, min(height - 1, y)):, x] = (25, 60, 30)
+    return image
+
+
+def test_motion_is_none_for_the_first_frame_not_zero():
+    frame = _noise(10)
+    assert features.motion(None, frame) is None
+    assert features.motion(frame, frame) == 0.0
+
+
+def test_motion_grows_with_the_change_between_samples():
+    still = _horizon(0.0)
+    nudged = _horizon(1.5)
+    moved = _horizon(6.0)
+    assert 0.0 < features.motion(still, nudged) < features.motion(still, moved)
+
+
+def test_horizon_tilt_measures_the_angle():
+    assert features.horizon_tilt(_horizon(0.0)) == pytest.approx(0.0, abs=0.02)
+    two = features.horizon_tilt(_horizon(2.0))
+    four = features.horizon_tilt(_horizon(4.0))
+    assert two is not None and four is not None
+    assert two < four
+    assert features.horizon_tilt(_horizon(2.0)) == pytest.approx(2.0 / features.TILT_FULL_DEGREES, abs=0.06)
+    assert features.horizon_tilt(_horizon(20.0)) == 1.0
+
+
+def test_a_frame_with_no_horizon_withholds_the_measurement():
+    """None means "cannot tell", and must never be scored as "level"."""
+    assert features.horizon_tilt(np.full((360, 640, 3), 120, np.uint8)) is None
+    assert features.horizon_tilt(_noise(11, size=256)) is None

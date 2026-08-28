@@ -290,9 +290,29 @@ def reason_component(name: str, value: float) -> str:
     return f"{name}: {value:.2f}"
 
 
+def reason_horizon_tilt(degrees: float) -> str:
+    return f"horizontas pakrypęs apie {degrees:.1f}°"
+
+
+def reason_subject_separation(value: float) -> str:
+    return f"objektas atsiskiria nuo fono: {value:.2f} (1 = labai aiškiai)"
+
+
+def reason_motion(percentile: float) -> str:
+    return f"judesys — {percentile:.0f}-as procentilis šiame įraše"
+
+
+def reason_motion_unknown() -> str:
+    return "judesio duomenų nėra (pirmas įrašo kadras)"
+
+
+#: Only for turning the 0..1 tilt back into degrees inside a message.
+TILT_FULL_DEGREES_FOR_TEXT = 8.0
+
 COMPONENT_CONTENT = "turinys"
 COMPONENT_TECHNICAL = "technika"
 COMPONENT_COMPOSITION = "kompozicija"
+COMPONENT_MOMENT = "momentas"
 
 
 # --------------------------------------------------------------------------
@@ -341,6 +361,26 @@ def threshold_none_passed(best: float, threshold: float) -> str:
 
 def threshold_capped(kept: int) -> str:
     return f"Apribota iki {kept} kadrų (--max-per-clip); ribą peržengė daugiau kandidatų"
+
+
+LOOK_NAMES = {
+    "none": "be profilio",
+    "nature": "gamta",
+    "city": "miestas",
+}
+
+
+def look_applied(name: str, strength: float) -> str:
+    return (
+        f"Eksportuojamiems kadrams pritaikytas spalvų profilis „{LOOK_NAMES.get(name, name)}“ "
+        f"(stiprumas {strength:.2f}). Kiekvienas kadras pirma išmatuojamas ir tik tada "
+        f"pastumiamas link profilio tikslų — nieko neužmetama ant viršaus vienodai. "
+        f"Analizės įverčiams profilis netaikomas."
+    )
+
+
+def look_none() -> str:
+    return "Spalvų profilis netaikytas (--look none)."
 
 
 def export_resolution_native() -> str:
@@ -492,6 +532,8 @@ GUI_MIN_SCORE = "Kokybės riba"
 GUI_MAX_PER_CLIP = "Daugiausia kadrų iš failo"
 GUI_OUT_DIR = "Rezultatų aplankas"
 GUI_SETTINGS = "Nustatymai"
+GUI_LOOK = "Spalvų profilis"
+GUI_LOOK_STRENGTH = "Profilio stiprumas"
 
 GUI_LOG_YES = "plokščias (log)"
 GUI_LOG_NO = "įprastas"
