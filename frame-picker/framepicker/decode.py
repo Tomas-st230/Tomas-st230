@@ -24,7 +24,11 @@ FFMPEG = "ffmpeg"
 ANALYSIS_LONG_EDGE = 640
 
 #: Filename fragments that hint at a flat/log picture profile.
-LOG_FILENAME_HINTS = ("dlog", "d-log", "dlogm", "d-log-m", "hlg", "slog", "s-log", "vlog", "v-log", "logc")
+LOG_FILENAME_HINTS = (
+    "dlog", "d-log", "dlogm", "d-log-m",      # DJI
+    "hlog", "h-log", "hovercine",             # HOVERAir
+    "hlg", "slog", "s-log", "vlog", "v-log", "logc", "flat",
+)
 
 #: Colour transfer characteristics that mean "not a normal display gamma".
 LOG_TRANSFER_TAGS = ("arib-std-b67", "smpte2084", "log100", "log316", "bt1361e")
