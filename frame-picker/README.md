@@ -27,6 +27,13 @@ Read this before trusting any output.
   report says that on every clip where it is used.
 * **Log detection is a guess** unless you force it with `--convert-log`. The
   guess, and what it was based on, is printed and written to `results.json`.
+* **The flatness thresholds that detect log footage are unverified.**
+  `LOG_STATS_MAX_LUMA_SPAN = 0.55` and `LOG_STATS_MAX_SATURATION = 0.22` separate
+  the synthetic fixtures cleanly (flat: 0.17 / 0.19, normal: 0.73–0.81 /
+  0.73–0.95) but have never been checked against real D-Log M footage. Every run
+  writes the measured `luma_span` and `saturation` of every clip into
+  `results.json` under `log.statistics` — send those numbers from your own files
+  and the thresholds can be set from data instead of guessed.
 * **Cross-clip comparison is weaker than the per-clip ranking.** Sharpness,
   dynamic range and colourfulness are converted to percentile ranks *inside a
   clip* before scoring, because absolute thresholds are wrong across cameras,
@@ -136,7 +143,8 @@ An input that matches nothing is named in the console and listed in
 | `--fps` | `2` | analysis sampling rate |
 | `--min-gap` | `2.0` | minimum seconds between two picked frames (or 3 % of the clip, whichever is larger) |
 | `--convert-log` | `auto` | `auto` uses metadata then filename hints; `on`/`off` force it |
-| `--lut` | – | `.cube` applied to **every** clip, for analysis *and* for the exported image |
+| `--lut` | – | `.cube` applied **only to clips detected as log**, for analysis *and* for the exported image |
+| `--lut-all` | off | force `--lut` onto every clip, log or not |
 | `--jobs` | auto | files processed in parallel (auto = `min(4, cpu_count)`) |
 | `--no-faces` | off | skip face detection entirely |
 | `--face-model` | – | explicit path to a YuNet `.onnx` |
@@ -146,14 +154,28 @@ An input that matches nothing is named in the console and listed in
 | `--max-candidates` | `3000` | upper bound on analysis frames buffered per clip |
 | `--hwaccel` | `auto` | `auto` tries CUDA, `none` forces CPU |
 
-GUI (a wrapper around the same functions — there is no second code path):
+GUI — a wrapper around the same functions. There is no second code path, and
+`gui/` holds no logic: it collects paths and settings, hands them to
+`run_batch`, and renders what comes back.
 
 ```bash
 python -m gui.drop_window
 ```
 
-One window: a drop area, a progress line, a cancel button, and an "open results
-folder" button when it finishes. Cancelling deletes the partial output.
+One window:
+
+* a drop area (files or whole folders; double-click opens a file dialog)
+* a settings block — the drone LUT with a file picker and the "apply to every
+  file" override, the log-detection mode, the quality threshold, the per-clip
+  bound, and the output folder
+* a table with one row per file: **profile** (log / normal), **colour** (LUT /
+  normalised / untouched), **decode path** (GPU / CPU), frames picked, status.
+  A skipped file says so and carries the reason as a tooltip — it never goes
+  blank.
+* a progress bar, the current status line, cancel, "open results folder" and
+  "open report"
+
+Cancelling deletes the partial output.
 
 ### Output
 
@@ -210,6 +232,37 @@ Four principles, stated so they can be argued with:
 Lithuanian, e.g. `veidas užima 22 % kadro`,
 `ryškumas — 91-as procentilis šiame įraše`, `12 % kadro perdegę`. A score with
 no reasons is indistinguishable from a random number.
+
+### Log / flat footage and the LUT
+
+Detection order: `--convert-log` flag → colour metadata → filename hint →
+**measured frame flatness** → off.
+
+The measurement step exists because the first three usually say nothing about a
+real DJI file: DJI does not put the picture profile in the filename, and often
+does not tag the colour transfer either. So twelve frames spread over the clip
+are decoded and two things are measured — the luma p1–p99 span and the mean HSV
+saturation — which is exactly what a log profile compresses. Both have to be
+below their threshold for the clip to count as log. It is still a guess, it is
+still labelled as one, and the measured numbers go into `results.json` so the
+thresholds can be calibrated.
+
+**A LUT follows the log verdict, per clip.** `--lut look.cube` is applied only
+to the clips detected as log — a `.cube` is a log-to-display conversion, and
+putting one on footage that is already Rec.709 wrecks it. A mixed card of D-Log
+and normal clips is the normal case, so this is the default; `--lut-all` forces
+the LUT onto everything when you know detection is wrong. When a clip is log and
+no LUT is supplied, the percentile normalisation is used instead, and the report
+says it is an approximation.
+
+The console names the decision for every file, so you can see which ones got the
+LUT:
+
+```
+Aptiktas plokščias (log) profilis. Pagrindas: išmatuotas kadrų plokštumas
+Išmatuota iš kadrų: šviesumo diapazonas 0.412, sodrumas 0.155
+Analizei pritaikytas LUT: D:\LUT\DJI_DLogM_to_Rec709.cube
+```
 
 ### Confidence
 
@@ -381,6 +434,11 @@ What that changed:
    `--global-top 0` turns it off.
 4. **Faces: always better.** Unchanged — any face over 1 % of the frame sets a
    high content floor for every clip, drone footage included.
+
+Asked for separately and also done: the LUT is applied per clip according to the
+log verdict rather than to the whole batch, frame flatness was added as a
+detection signal because DJI files carry no usable filename or colour tag, and
+the window grew a settings block and a per-file table.
 
 ## Still open
 

@@ -29,6 +29,16 @@ LOG_FILENAME_HINTS = ("dlog", "d-log", "dlogm", "d-log-m", "hlg", "slog", "s-log
 #: Colour transfer characteristics that mean "not a normal display gamma".
 LOG_TRANSFER_TAGS = ("arib-std-b67", "smpte2084", "log100", "log316", "bt1361e")
 
+#: Measured flatness limits below which a clip is treated as log.
+#: Both must hold. DJI does not put the picture profile in the filename and
+#: often does not tag the colour transfer either, so measuring the frames is
+#: the only signal left. These two numbers are STARTING VALUES separating
+#: synthetic fixtures (flat: 0.17 / 0.19, normal: 0.73-0.81 / 0.73-0.95); they
+#: have never been checked against real D-Log M footage, and every run writes
+#: the measured values into results.json so they can be calibrated.
+LOG_STATS_MAX_LUMA_SPAN = 0.55
+LOG_STATS_MAX_SATURATION = 0.22
+
 
 class DecodeError(RuntimeError):
     pass
@@ -42,9 +52,10 @@ class DecodeError(RuntimeError):
 @dataclass
 class LogVerdict:
     is_log: bool
-    source: str          # machine-readable key: flag | metadata | filename | default
+    source: str          # flag | metadata | filename | statistics | default
     detail: str          # what exactly was seen
     is_a_guess: bool
+    statistics: dict | None = None
 
     def as_dict(self) -> dict:
         return {
@@ -52,33 +63,74 @@ class LogVerdict:
             "source": self.source,
             "detail": self.detail,
             "is_a_guess": self.is_a_guess,
+            "statistics": self.statistics,
+            "thresholds": {
+                "max_luma_span": LOG_STATS_MAX_LUMA_SPAN,
+                "max_saturation": LOG_STATS_MAX_SATURATION,
+            },
         }
 
 
-def detect_log(clip: ClipInfo, flag: str = "auto") -> LogVerdict:
+def flatness(samples: Sequence[np.ndarray]) -> dict | None:
+    """Mean luma span and mean saturation over a few sample frames.
+
+    These are the two things a log profile does to an ungraded frame: it
+    compresses the luma range and desaturates. Measuring them is more
+    reliable than hoping the camera wrote a colour tag or the profile name
+    into the filename - DJI usually writes neither.
+    """
+    from .features import dynamic_range, saturation_mean
+
+    usable = [s for s in samples if s is not None and s.size]
+    if not usable:
+        return None
+    spans = [dynamic_range(frame) for frame in usable]
+    sats = [saturation_mean(frame) for frame in usable]
+    return {
+        "luma_span": float(sum(spans) / len(spans)),
+        "saturation": float(sum(sats) / len(sats)),
+        "frames_measured": len(usable),
+    }
+
+
+def detect_log(clip: ClipInfo, flag: str = "auto", stats: dict | None = None) -> LogVerdict:
     """Decide whether *clip* is flat/log footage.
 
-    Order: explicit flag -> colour metadata -> filename hint -> off.
-    The result is a guess unless the user forced it, and it says so.
+    Order: explicit flag -> colour metadata -> filename hint -> measured frame
+    flatness -> off. The result is a guess unless the user forced it, and it
+    says so. *stats* comes from :func:`flatness`; when it is ``None`` the
+    measurement step is skipped.
     """
     if flag == "on":
-        return LogVerdict(True, "flag", "--convert-log on", is_a_guess=False)
+        return LogVerdict(True, "flag", "--convert-log on", is_a_guess=False, statistics=stats)
     if flag == "off":
-        return LogVerdict(False, "flag", "--convert-log off", is_a_guess=False)
+        return LogVerdict(False, "flag", "--convert-log off", is_a_guess=False, statistics=stats)
 
     transfer = (clip.color_transfer or "").lower()
     primaries = (clip.color_primaries or "").lower()
     if transfer in LOG_TRANSFER_TAGS:
-        return LogVerdict(True, "metadata", f"color_transfer={transfer}", is_a_guess=True)
+        return LogVerdict(True, "metadata", f"color_transfer={transfer}", is_a_guess=True, statistics=stats)
     if primaries == "bt2020" and transfer not in ("bt709", "bt470bg", "smpte170m", "iec61966-2-1"):
-        return LogVerdict(True, "metadata", f"color_primaries={primaries}, color_transfer={transfer or '?'}", is_a_guess=True)
+        return LogVerdict(
+            True, "metadata",
+            f"color_primaries={primaries}, color_transfer={transfer or '?'}",
+            is_a_guess=True, statistics=stats,
+        )
 
     lowered = clip.name.lower()
     for hint in LOG_FILENAME_HINTS:
         if hint in lowered:
-            return LogVerdict(True, "filename", f"'{hint}' in {clip.name}", is_a_guess=True)
+            return LogVerdict(True, "filename", f"'{hint}' in {clip.name}", is_a_guess=True, statistics=stats)
 
-    return LogVerdict(False, "default", "no log evidence", is_a_guess=True)
+    if stats is not None:
+        flat = (
+            stats["luma_span"] < LOG_STATS_MAX_LUMA_SPAN
+            and stats["saturation"] < LOG_STATS_MAX_SATURATION
+        )
+        detail = f"luma_span={stats['luma_span']:.3f}, saturation={stats['saturation']:.3f}"
+        return LogVerdict(flat, "statistics", detail, is_a_guess=True, statistics=stats)
+
+    return LogVerdict(False, "default", "no log evidence", is_a_guess=True, statistics=stats)
 
 
 # --------------------------------------------------------------------------

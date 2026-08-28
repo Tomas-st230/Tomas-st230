@@ -128,7 +128,19 @@ def log_not_detected(source: str) -> str:
 LOG_SOURCE_FLAG = "naudotojo nurodyta vėliavėlė --convert-log"
 LOG_SOURCE_METADATA = "spalvų metaduomenys faile"
 LOG_SOURCE_FILENAME = "užuomina failo pavadinime"
+LOG_SOURCE_STATISTICS = "išmatuotas kadrų plokštumas"
 LOG_SOURCE_DEFAULT = "numatytoji reikšmė (išjungta)"
+
+
+def log_statistics(luma_span: float, saturation: float) -> str:
+    return f"Išmatuota iš kadrų: šviesumo diapazonas {luma_span:.3f}, sodrumas {saturation:.3f}"
+
+
+def log_thresholds(max_span: float, max_saturation: float) -> str:
+    return (
+        f"Plokščio profilio ribos: diapazonas < {max_span:.2f} IR sodrumas < {max_saturation:.2f}. "
+        f"Tai pradinės, NEIŠMATUOTOS reikšmės — atsiųskite savo failų skaičius kalibravimui."
+    )
 
 
 def log_is_a_guess() -> str:
@@ -152,6 +164,17 @@ def normalisation_applied() -> str:
 
 def no_conversion_applied() -> str:
     return "Analizei jokia spalvų transformacija netaikyta."
+
+
+def lut_skipped_not_log() -> str:
+    return (
+        "LUT nepritaikytas: šis įrašas neatpažintas kaip plokščias (log), o LUT ant "
+        "įprastos Rec.709 medžiagos ją sugadintų. Priverstinai — vėliavėlė --lut-all."
+    )
+
+
+def lut_forced_on_all() -> str:
+    return "LUT pritaikytas priverstinai visiems įrašams (--lut-all), neatsižvelgiant į profilį."
 
 
 def lut_unreadable(path: str, detail: str) -> str:
@@ -368,10 +391,46 @@ REPORT_NO_FRAMES = "Nė vieno kadro parinkti nepavyko."
 # GUI
 # --------------------------------------------------------------------------
 
-GUI_DROP_HERE = "Nutempkite vaizdo failus čia"
+GUI_DROP_HERE = "Nutempkite vaizdo failus arba aplanką čia\n(dukart spustelėkite, kad pasirinktumėte)"
 GUI_START = "Pradėti"
 GUI_CANCEL = "Atšaukti"
 GUI_OPEN_FOLDER = "Atverti rezultatų aplanką"
+GUI_OPEN_REPORT = "Atverti ataskaitą"
+GUI_CLEAR = "Išvalyti sąrašą"
 GUI_IDLE = "Laukiama failų"
 GUI_DONE = "Baigta"
 GUI_CANCELLED = "Atšaukta"
+
+GUI_COL_FILE = "Failas"
+GUI_COL_PROFILE = "Profilis"
+GUI_COL_COLOR = "Spalvos"
+GUI_COL_DECODE = "Dekodavimas"
+GUI_COL_FRAMES = "Kadrai"
+GUI_COL_STATUS = "Būsena"
+
+GUI_LUT = "Drono LUT (.cube)"
+GUI_BROWSE = "Parinkti…"
+GUI_LUT_ALL = "Taikyti visiems failams"
+GUI_LUT_HINT = (
+    "LUT pritaikomas tik tiems failams, kurie atpažinti kaip plokšti (D-Log M, HLG ir pan.). "
+    "Įprastų Rec.709 failų partijoje jis nekeičiamas — LUT juos sugadintų."
+)
+GUI_PROFILE = "Plokščio profilio aptikimas"
+GUI_PROFILE_AUTO = "automatiškai"
+GUI_PROFILE_ON = "visi failai yra log"
+GUI_PROFILE_OFF = "nė vienas nėra log"
+GUI_MIN_SCORE = "Kokybės riba"
+GUI_MAX_PER_CLIP = "Daugiausia kadrų iš failo"
+GUI_OUT_DIR = "Rezultatų aplankas"
+GUI_SETTINGS = "Nustatymai"
+
+GUI_LOG_YES = "plokščias (log)"
+GUI_LOG_NO = "įprastas"
+GUI_UNKNOWN = "—"
+GUI_WAITING = "laukia"
+GUI_FAILED = "praleista"
+GUI_COLOR_LUT = "LUT"
+GUI_COLOR_NORMALISE = "normalizuota"
+GUI_COLOR_NONE = "be pakeitimų"
+GUI_DECODE_HW = "GPU (CUDA)"
+GUI_DECODE_CPU = "CPU"

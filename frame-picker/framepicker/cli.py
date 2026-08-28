@@ -67,6 +67,7 @@ class Options:
     min_gap: float = DEFAULT_MIN_GAP
     convert_log: str = "auto"
     lut: str | None = None
+    lut_all: bool = False
     jobs: int = 0
     no_faces: bool = False
     face_model: str | None = None
@@ -88,6 +89,7 @@ class Options:
             "min_gap": self.min_gap,
             "convert_log": self.convert_log,
             "lut": self.lut,
+            "lut_all": self.lut_all,
             "jobs": self.jobs,
             "no_faces": self.no_faces,
             "image_format": self.image_format,
@@ -205,29 +207,57 @@ def analyse_clip(
     }
 
     # -- colour ------------------------------------------------------------
-    verdict = decode.detect_log(clip, options.convert_log)
+    # Sample a handful of frames first: the flatness measurement is the only
+    # log signal left when the camera tags nothing and the filename says
+    # nothing, which is the normal case for DJI files.
+    samples: list = []
+    stats = None
+    if options.convert_log != "off":
+        samples = decode.sample_for_normalisation(clip)
+        stats = decode.flatness(samples)
+
+    verdict = decode.detect_log(clip, options.convert_log, stats)
     record["log"] = verdict.as_dict()
-    record["notes"].append(
+    log_line = (
         S.log_detected(_log_source_text(verdict.source)) if verdict.is_log
         else S.log_not_detected(_log_source_text(verdict.source))
     )
+    record["notes"].append(log_line)
+    messenger.say(log_line)
+    if stats is not None:
+        measured = S.log_statistics(stats["luma_span"], stats["saturation"])
+        record["notes"].append(measured)
+        messenger.say(measured)
+        thresholds = S.log_thresholds(
+            decode.LOG_STATS_MAX_LUMA_SPAN, decode.LOG_STATS_MAX_SATURATION
+        )
+        record["notes"].append(thresholds)
+        messenger.once("log-thresholds", thresholds)
     if verdict.is_a_guess:
         record["notes"].append(S.log_is_a_guess())
+        messenger.once("log-guess", S.log_is_a_guess())
 
     lut_path = None
     normalisation = None
     if options.lut:
         readable, why = decode.cube_is_readable(options.lut)
-        if readable:
+        if not readable:
+            _note(record, messenger, S.lut_unreadable(options.lut, why))
+        elif verdict.is_log or options.lut_all:
+            # A LUT is a log-to-display conversion. Putting one on footage
+            # that is already Rec.709 wrecks it, and a mixed batch of D-Log
+            # and normal clips is the normal case - so the LUT follows the
+            # log verdict unless the user forces it onto everything.
             lut_path = options.lut
-            record["notes"].append(S.lut_applied(options.lut))
+            _note(record, messenger, S.lut_applied(options.lut))
+            if options.lut_all and not verdict.is_log:
+                _note(record, messenger, S.lut_forced_on_all())
         else:
-            record["notes"].append(S.lut_unreadable(options.lut, why))
+            _note(record, messenger, S.lut_skipped_not_log())
     if lut_path is None and verdict.is_log:
-        samples = decode.sample_for_normalisation(clip)
-        normalisation = decode.estimate_normalisation(samples)
+        normalisation = decode.estimate_normalisation(samples) if samples else None
         if normalisation is not None:
-            record["notes"].append(S.normalisation_applied())
+            _note(record, messenger, S.normalisation_applied())
     if lut_path is None and normalisation is None:
         record["notes"].append(S.no_conversion_applied())
     record["color"] = {
@@ -423,11 +453,18 @@ def analyse_clip(
     return record
 
 
+def _note(record: dict, messenger: Messenger, text: str) -> None:
+    """A decision the user has to be able to see: report it and print it."""
+    record["notes"].append(text)
+    messenger.say(text)
+
+
 def _log_source_text(source: str) -> str:
     return {
         "flag": S.LOG_SOURCE_FLAG,
         "metadata": S.LOG_SOURCE_METADATA,
         "filename": S.LOG_SOURCE_FILENAME,
+        "statistics": S.LOG_SOURCE_STATISTICS,
         "default": S.LOG_SOURCE_DEFAULT,
     }.get(source, source)
 
@@ -477,10 +514,36 @@ def expand_inputs(paths: Sequence[str]) -> tuple[list[str], list[str]]:
     return unique, unmatched
 
 
+def clip_summary(index: int, path: str, record: dict | None, reason: str = "") -> dict:
+    """Flat, display-ready summary of one file. Built here so the GUI can
+    render a table without knowing anything about the pipeline."""
+    if record is None:
+        return {
+            "index": index, "path": path, "name": os.path.basename(path), "ok": False,
+            "is_log": None, "log_source": "", "color_mode": "", "decode_path": "",
+            "frames": 0, "elapsed_s": 0.0, "reason": reason,
+        }
+    log = record.get("log", {})
+    return {
+        "index": index,
+        "path": path,
+        "name": record.get("probe", {}).get("name") or os.path.basename(path),
+        "ok": True,
+        "is_log": log.get("is_log"),
+        "log_source": log.get("source", ""),
+        "color_mode": record.get("color", {}).get("mode", ""),
+        "decode_path": record.get("decode", {}).get("path_used", ""),
+        "frames": len(record.get("frames", [])),
+        "elapsed_s": float(record.get("elapsed_s") or 0.0),
+        "reason": "",
+    }
+
+
 def run_batch(
     options: Options,
     on_message: Callable[[str], None] | None = None,
     cancel: threading.Event | None = None,
+    on_clip_done: Callable[[dict], None] | None = None,
 ) -> BatchResult:
     """Process every file in ``options.paths``. One bad file never aborts it."""
     messenger = Messenger(on_message)
@@ -513,15 +576,21 @@ def run_batch(
         messenger.say(S.processing_file(index + 1, len(paths), os.path.basename(path)))
         try:
             clips[index] = analyse_clip(path, options, messenger, created, cancel)
+            if on_clip_done is not None:
+                on_clip_done(clip_summary(index, path, clips[index]))
         except ProbeError as exc:
             messenger.say(S.probe_failed(os.path.basename(path), str(exc)))
             with lock:
                 skipped.append({"path": path, "reason": str(exc)})
+            if on_clip_done is not None:
+                on_clip_done(clip_summary(index, path, None, str(exc)))
         except Exception as exc:  # noqa: BLE001 - one bad file must not kill the batch
             detail = f"{type(exc).__name__}: {exc}"
             messenger.say(S.probe_failed(os.path.basename(path), detail))
             with lock:
                 skipped.append({"path": path, "reason": detail})
+            if on_clip_done is not None:
+                on_clip_done(clip_summary(index, path, None, detail))
 
     jobs = options.jobs if options.jobs and options.jobs > 0 else min(4, os.cpu_count() or 1)
     if jobs == 1:
@@ -638,7 +707,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="minimum seconds between two picked frames")
     parser.add_argument("--convert-log", choices=("auto", "on", "off"), default="auto",
                         help="treat the footage as flat/log")
-    parser.add_argument("--lut", default=None, help="path to a .cube LUT used for analysis and export")
+    parser.add_argument("--lut", default=None,
+                        help="path to a .cube LUT, applied only to clips detected as log")
+    parser.add_argument("--lut-all", action="store_true",
+                        help="apply --lut to every clip, log or not (wrecks Rec.709 footage)")
     parser.add_argument("--jobs", type=int, default=0, help="files processed in parallel (0 = auto)")
     parser.add_argument("--no-faces", action="store_true", help="skip face detection entirely")
     parser.add_argument("--face-model", default=None, help="explicit path to a YuNet .onnx model")
@@ -663,6 +735,7 @@ def options_from_args(args: argparse.Namespace) -> Options:
         min_gap=args.min_gap,
         convert_log=args.convert_log,
         lut=args.lut,
+        lut_all=args.lut_all,
         jobs=args.jobs,
         no_faces=args.no_faces,
         face_model=args.face_model,
