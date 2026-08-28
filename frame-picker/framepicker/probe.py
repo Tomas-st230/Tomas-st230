@@ -144,5 +144,9 @@ def probe(path: str | os.PathLike[str]) -> ClipInfo:
             "profile": video.get("profile"),
             "field_order": video.get("field_order"),
             "tags": video.get("tags", {}),
+            # Container-level tags are where a camera usually writes its make,
+            # model and firmware. Kept so the report can answer "what shot
+            # this?" without anyone having to remember.
+            "format_tags": fmt.get("tags", {}),
         },
     )

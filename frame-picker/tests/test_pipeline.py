@@ -333,3 +333,11 @@ def test_an_input_that_matches_nothing_is_reported_not_ignored(tmp_path):
     result = run_batch(Options(paths=[ghost], out_dir=str(tmp_path / "out")))
     assert S.input_not_found(ghost) in result.messages
     assert S.no_input_files() in result.messages
+
+
+@requires_ffmpeg
+def test_container_tags_are_kept_so_the_camera_can_be_identified(normal_clip):
+    """A camera writes its make and model into the container, not the stream."""
+    clip = probe(normal_clip)
+    assert "format_tags" in clip.extra
+    assert isinstance(clip.extra["format_tags"], dict)
